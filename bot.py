@@ -142,7 +142,7 @@ async def get_chat_lock(chat_id):
         chat_locks[chat_id] = asyncio.Lock()
     return chat_locks[chat_id]
 
-# ── SSRF guard (Domain Whitelist ဖယ်ထား) ────────────────────────────
+# ── SSRF guard ─────────────────────────────────────────────────────────────
 def is_safe_url(url: str) -> bool:
     try:
         parsed = urlparse(url)
@@ -237,8 +237,8 @@ async def Varify_Captcha(session_obj, session_id, text):
         data = await req.json(content_type=None)
         return session_id if data.get("success") == True else None
 
+# 🔥 FIX: Timeout 60 seconds ထားပြီး Redirect ကို သေချာလိုက်ပါ
 async def check_session_url(session_url):
-    """WiFidog portal URL ကို sessionId ပါမပါ စစ်ဆေးပါ (Timeout 30s)"""
     if not is_safe_url(session_url):
         logger.warning(f"Session URL failed safety check: {session_url}")
         return False
@@ -248,21 +248,28 @@ async def check_session_url(session_url):
     }
     try:
         test_url = replace_mac(session_url, get_mac())
+        logger.info(f"check_session_url: Testing URL: {test_url}")
         async with session.get(test_url, allow_redirects=True, headers=headers,
-                                timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                                timeout=aiohttp.ClientTimeout(total=60)) as resp:
             final_url = str(resp.url)
-            logger.info(f"check_session_url final URL: {final_url}")
+            logger.info(f"check_session_url: Final URL after redirects: {final_url}")
+            # sessionId ကို ပိုပြီး ကျယ်ပြန့်တဲ့ pattern နဲ့ ရှာပါ
             if "sessionId" in final_url:
                 logger.info("Session check: sessionId found in redirect URL")
                 return True
+            # Response body ထဲမှာ ရှာပါ
             text = await resp.text()
             if re.search(r'"sessionId"\s*:\s*"([a-zA-Z0-9]+)"', text):
                 logger.info("Session check: sessionId found in response body")
                 return True
-            logger.warning("Session check: no sessionId found")
+            # Query string မှာ ရှာပါ (တစ်ခါတလေ ဒီလိုပါတတ်တယ်)
+            if re.search(r'[?&]sessionId=([a-zA-Z0-9]+)', text):
+                logger.info("Session check: sessionId found in response text query")
+                return True
+            logger.warning("Session check: no sessionId found anywhere")
             return False
     except asyncio.TimeoutError:
-        logger.error(f"check_session_url TIMEOUT for {session_url}")
+        logger.error(f"check_session_url TIMEOUT (60s) for {session_url}")
         return False
     except Exception as e:
         logger.error(f"check_session_url error: {type(e).__name__}: {e}", exc_info=True)
@@ -512,7 +519,7 @@ async def cmd_setup(message):
         return
     url     = args[1].strip()
     chat_id = message.chat.id
-    await bot.reply_to(message, "⏳ Session URL စစ်ဆေးနေပါသည်...")
+    await bot.reply_to(message, "⏳ Session URL စစ်ဆေးနေပါသည်... (စက္ကန့် ၆၀ အထိ ကြာနိုင်ပါသည်)")
     if await check_session_url(url):
         user_data[chat_id] = {'session_url': url}
         success_texts.pop(chat_id, None)
@@ -523,7 +530,7 @@ async def cmd_setup(message):
         limited_messages.pop(chat_id, None)
         await bot.reply_to(message, "✅ Session URL သိမ်းဆည်းပြီးပါပြီ!\n/brute ဖြင့် စတင်နိုင်ပါပြီ။")
     else:
-        await bot.reply_to(message, "❌ Session URL မှားယွင်းနေပါသည် (သို့) sessionId မတွေ့ပါ။")
+        await bot.reply_to(message, "❌ Session URL မှားယွင်းနေပါသည် (သို့) sessionId မတွေ့ပါ။\n\n💡 အကြံပြုချက်:\n1. သင့် Browser မှာ ဒီ URL ကို ဖွင့်ကြည့်ပါ။\n2. Redirect ဖြစ်သွားတဲ့ URL မှာ `sessionId` ပါလား စစ်ကြည့်ပါ။\n3. ပြီးရင် အဲဒီ Redirect URL ကို `/setup` နဲ့ ထပ်စမ်းကြည့်ပါ။")
 
 @bot.message_handler(commands=['brute'])
 async def cmd_brute(message):
@@ -726,7 +733,6 @@ async def cmd_recheck(message):
 
 # ── Polling and main ──────────────────────────────────────────────────────
 async def start_polling():
-    # Bot စမီ webhook ကို ဖျက်ပြီး 409 Conflict ကိုကာကွယ်ပါ
     try:
         await bot.delete_webhook()
         logger.info("Webhook deleted successfully")
@@ -750,7 +756,7 @@ async def main():
         timeout=aiohttp.ClientTimeout(total=30),
         connector=_connector, connector_owner=False
     )
-    logger.info("🚀 Voucher Bot starting... (WiFidog Portal Compatible + Fixed 409)")
+    logger.info("🚀 Voucher Bot starting... (WiFidog Portal Compatible + 60s Timeout)")
     try:
         asyncio.create_task(web_server())
         await start_polling()
