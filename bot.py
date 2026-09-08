@@ -2,7 +2,7 @@
 Voucher Checker Bot — No Approval / Fully Fixed
 ================================================
 - Fixed 'length' variable bug
-- Fixed 409 conflict (skip_pending=True)
+- Fixed 409 conflict (allowed_updates parameter)
 - Improved WiFiDog URL parsing
 - No Key/Admin required
 - SQLite + OCR
@@ -264,8 +264,8 @@ class ScanState:
 
 class VoucherBot:
     def __init__(self):
-        # skip_pending=True to avoid 409 conflict
-        self.bot = AsyncTeleBot(BOT_TOKEN, skip_pending=True)
+        # No skip_pending parameter - use allowed_updates instead
+        self.bot = AsyncTeleBot(BOT_TOKEN)
         self.db = Database()
         self.captcha = CaptchaOCR()
         self.user_data: Dict[int, Dict] = {}
@@ -544,7 +544,7 @@ class VoucherBot:
                 total += v
         return total
 
-    # ─── FIXED: iter_codes with length parameter ───────────────────────────
+    # ─── iter_codes with length parameter ──────────────────────────────────
     def iter_codes(self, mode, length=None, start_digit=None):
         if isinstance(mode, int):
             cs = CHARSETS.get(mode)
@@ -1543,7 +1543,6 @@ Portal URL အသစ်ထည့်ပါက ယခင် URL ပျက်သွ
         backoff = 5
         while True:
             try:
-                # skip_pending=True already set, so no 409 conflict
                 await self.bot.infinity_polling(timeout=20, request_timeout=20)
                 return
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
