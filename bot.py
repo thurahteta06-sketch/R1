@@ -9,8 +9,9 @@ from datetime import datetime, timedelta, timezone
 
 # ── Environment variables ─────────────────────────────────────────────────
 BOT_TOKEN =
+8776954128:AAEvKRIXhvzuk5ua_o91IXBV0sXvUl0yzGM
 GITHUB_TOKEN =
-ADMIN_ID =
+ADMIN_ID =1626617395
 REPO_OWNER =
 REPO_NAME =
 
