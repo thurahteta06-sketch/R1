@@ -8,15 +8,30 @@ import numpy as np
 from datetime import datetime, timedelta, timezone
 
 # ==================== CONFIGURATION ====================
-BOT_TOKEN    = ""
-GITHUB_TOKEN = ""
-REPO_OWNER   = ""
-REPO_NAME    = ""
+# Railway Variables tab တွင် ထည့်ရမည်
+BOT_TOKEN    = os.environ.get("BOT_TOKEN",    "")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+REPO_OWNER   = os.environ.get("REPO_OWNER",   "")
+REPO_NAME    = os.environ.get("REPO_NAME",    "")
 
+# Admin Telegram IDs — ဤနေရာတွင် တိုက်ရိုက်ထည့်ပါ
 ADMINS = [
-    "",
-    ""
+    "",   # Admin 1 ID
+    "",   # Admin 2 ID
 ]
+
+# Startup validation
+_missing = [k for k, v in {
+    "BOT_TOKEN":    BOT_TOKEN,
+    "GITHUB_TOKEN": GITHUB_TOKEN,
+    "REPO_OWNER":   REPO_OWNER,
+    "REPO_NAME":    REPO_NAME,
+}.items() if not v]
+if _missing:
+    raise SystemExit(
+        f"❌ Railway Variables tab တွင် အောက်ပါများ မထည့်ရသေးပါ:\n"
+        + "\n".join(f"   • {k}" for k in _missing)
+    )
 
 def is_admin(user_id):
     return str(user_id) in ADMINS
