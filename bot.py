@@ -22,7 +22,6 @@ SUCCESS_CODE = asyncio.Queue()
 bot = AsyncTeleBot(BOT_TOKEN)
 
 user_data = {}              # {chat_id: {"session_url": ...}}
-approve = {}                # {chat_id: True/False}
 scan_tasks = {}             # {chat_id: {"task": asyncio.Task, "stop": bool, "scan_id": str}}
 success_texts = {}          # {chat_id: [{"code": ..., "session_id": ..., "plan": ...}, ...]}
 limited_texts = {}          # {chat_id: [code, ...]}
@@ -84,6 +83,7 @@ async def update_file_content(path, content, sha, message):
 
 # ── Helper functions ───────────────────────────────────────────────────────
 def check_key_expiration(expiration_time):
+    # Kept for admin commands only
     try:
         if isinstance(expiration_time, dict):
             expiry = expiration_time.get("expires_at")
@@ -222,7 +222,7 @@ async def get_balance(token):
         print(f"[get_balance] error for {token}: {e}")
         return "N/A"
 
-# ── NEW CODE GENERATOR for modes 1-5 ─────────────────────────────────────
+# ── CODE GENERATOR for modes 1-5 ──────────────────────────────────────
 def iter_codes(mode, length):
     """Generate codes based on mode and length.
     mode: 1=digits, 2=lowercase, 3=uppercase, 4=mixed case, 5=letters+digits
@@ -266,7 +266,7 @@ def format_progress(checked, total=None, speed=0, found=0, target=None, mode=Non
         lines.append(f"🎯 Target: {found}/{target}")
     return "\n".join(lines)
 
-# ── Captcha handling (unchanged) ──────────────────────────────────────────
+# ── Captcha handling ──────────────────────────────────────────────────────
 _ocr = ddddocr.DdddOcr(show_ad=False)
 
 def _ocr_sync(image_bytes):
@@ -380,7 +380,7 @@ async def check_session_url(session_url):
     except:
         return False
 
-# ── Core voucher check (unchanged) ──────────────────────────────────────
+# ── Core voucher check ──────────────────────────────────────────────────
 async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False, message=None, plan_filters=None):
     global _connector
     if not recheck:
@@ -529,7 +529,7 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
             except:
                 pass
 
-# ── Brute-force runner (updated for new generator) ──────────────────────
+# ── Brute-force runner (KEY CHECKS REMOVED) ─────────────────────────────
 async def run_bruteforce(mode, length, chat_id, session_url, scan_id, target=None, message=None, progress_msg=None, plan_filters=None):
     try:
         code_iter = iter_codes(mode, length)
@@ -537,18 +537,14 @@ async def run_bruteforce(mode, length, chat_id, session_url, scan_id, target=Non
         await bot.send_message(chat_id, str(e))
         return
 
-    # Determine total if finite (only for digits and length small enough)
     total = None
     if mode == 1:
         total = 10 ** length
         if total > 1_000_000:
-            total = None  # we use infinite random
-    else:
-        total = None
+            total = None
 
     checked = 0
     found = 0
-    last_key_check = time.monotonic()
     scan_start = time.monotonic()
 
     global _voucher_sem
@@ -574,17 +570,7 @@ async def run_bruteforce(mode, length, chat_id, session_url, scan_id, target=Non
             if not batch:
                 break
 
-            if time.monotonic() - last_key_check >= 600:
-                auth_list, _ = await get_file_content("auth_list.json")
-                if (
-                    str(chat_id) not in auth_list
-                    or not check_key_expiration(auth_list[str(chat_id)])
-                ):
-                    approve[chat_id] = False
-                    await bot.send_message(chat_id, "သင်၏ key သက်တမ်း ကုန်ဆုံးသွားပါပြီ။")
-                    scan_tasks.pop(chat_id, None)
-                    return
-                last_key_check = time.monotonic()
+            # ⚠️ KEY EXPIRY CHECK REMOVED HERE ⚠️
 
             async def _check(code):
                 async with _voucher_sem:
@@ -632,7 +618,7 @@ async def run_bruteforce(mode, length, chat_id, session_url, scan_id, target=Non
     finally:
         scan_tasks.pop(chat_id, None)
 
-# ── GitHub update scheduler (unchanged) ──────────────────────────────────
+# ── GitHub update scheduler ──────────────────────────────────────────────
 async def github_update_scheduler():
     global SUCCESS_CODE
     while True:
@@ -663,7 +649,7 @@ async def start(message):
 async def help_cmd(message):
     help_text = (
         "📚 **Command လမ်းညွှန်**\n\n"
-        "/key - သင်၏ key ကို အတည်ပြုရန်\n"
+        "🔑 **Key မလိုတော့ပါ** (စနစ်အားလုံး ဖြုတ်ထားသည်)\n\n"
         "/setup [session_url] - Session URL သတ်မှတ်ရန်\n"
         "/brute <mode> <length> [target] [plan1] [plan2] ... - Code စတင်ရှာဖွေရန်\n"
         "   Mode:\n"
@@ -683,28 +669,14 @@ async def help_cmd(message):
         "/notify - code တွေ့တိုင်း အကြောင်းကြားချက် On/Off\n"
         "/recheck - သိမ်းထားသော success codes များကို ပြန်လည်စစ်ဆေးရန်\n"
         "/status - (Admin) Bot အခြေအနေကြည့်ရန်\n"
-        "/genkey <duration> <user_id> - (Admin) Key ထုတ်ပေးရန်\n"
-        "   duration: 30m, 1h, 2d, 1h30m, unlimited\n"
+        "/genkey <duration> <user_id> - (Admin) Key ထုတ်ပေးရန် (မသုံးလည်းရ)\n"
         "/delkey <user_id> - (Admin) Key ဖျက်ရန်\n"
         "/listkeys - (Admin) Key များကြည့်ရန်\n"
         "/testbalance - (Admin) Success codes များ၏ balance စစ်ဆေးရန်"
     )
     await bot.reply_to(message, help_text, parse_mode="Markdown")
 
-@bot.message_handler(commands=['key'])
-async def handle_key(message):
-    key = str(message.chat.id)
-    auth_list, _ = await get_file_content("auth_list.json")
-    if key in auth_list:
-        if check_key_expiration(auth_list[key]):
-            approve[message.chat.id] = True
-            user_data[message.chat.id] = {}
-            await bot.reply_to(message, "✅ Key မှန်ကန်ပါသည်။ /setup ဖြင့် Session URL ထည့်ပါ။")
-        else:
-            approve[message.chat.id] = False
-            await bot.reply_to(message, "❌ Key Expired ဖြစ်နေပါသည်။")
-    else:
-        await bot.reply_to(message, "သင်၏ key ကို registered မလုပ်ရသေးပါ။")
+# ── /key command ကို ဖယ်ရှားထားပါသည် ──
 
 @bot.message_handler(commands=['setup'])
 async def handle_setup(message):
@@ -713,9 +685,7 @@ async def handle_setup(message):
         await bot.reply_to(message, "အသုံးပြုနည်း:\n/setup your_session_url")
         return
     url = args[1]
-    if not approve.get(message.chat.id, False):
-        await bot.reply_to(message, "/key ဖြင့် အတည်ပြုပြီးမှ အသုံးပြုပါ။")
-        return
+    # KEY CHECK REMOVED
     await bot.reply_to(message, "Session URL စစ်ဆေးနေပါသည်...")
     if await check_session_url(url):
         cid = message.chat.id
@@ -792,9 +762,7 @@ async def brute(message):
             return
 
     chat_id = message.chat.id
-    if not approve.get(chat_id, False):
-        await bot.reply_to(message, "/key ဖြင့် အတည်ပြုပြီးမှ အသုံးပြုပါ။")
-        return
+    # KEY CHECK REMOVED
     if chat_id not in user_data or 'session_url' not in user_data[chat_id]:
         await bot.reply_to(message, "/setup ဖြင့် Session URL ထည့်ပါ။")
         return
@@ -923,9 +891,7 @@ async def toggle_notify(message):
 @bot.message_handler(commands=['recheck'])
 async def recheck(message):
     chat_id = message.chat.id
-    if not approve.get(chat_id, False):
-        await bot.reply_to(message, "/key ဖြင့် အတည်ပြုပြီးမှ အသုံးပြုပါ။")
-        return
+    # KEY CHECK REMOVED
     if chat_id not in user_data or 'session_url' not in user_data[chat_id]:
         await bot.reply_to(message, "/setup ဖြင့် Session URL ထည့်ပါ။")
         return
@@ -957,7 +923,6 @@ async def status(message):
         await bot.reply_to(message, "No Permission")
         return
     active_scans = sum(1 for data in scan_tasks.values() if not data["task"].done())
-    approved_users = sum(1 for v in approve.values() if v)
     uptime_seconds = int(time.monotonic() - _start_time)
     hours, remainder = divmod(uptime_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
@@ -966,7 +931,6 @@ async def status(message):
         f"📊 Bot Status\n\n"
         f"⏱ Uptime: {hours}h {minutes}m {seconds}s\n"
         f"🔍 Active Scans: {active_scans}\n"
-        f"✅ Approved Users: {approved_users}\n"
         f"👥 Sessions Loaded: {len(user_data)}"
     )
 
@@ -1053,8 +1017,6 @@ async def delkey(message):
         return
     del auth_list[user_id]
     await update_file_content("auth_list.json", auth_list, sha, f"Delete key for {user_id}")
-    approve.pop(int(user_id), None)
-    user_data.pop(int(user_id), None)
     await bot.reply_to(message, f"✅ Key Deleted\n\nUSER ID : {user_id}")
 
 @bot.message_handler(commands=['listkeys'])
@@ -1120,7 +1082,7 @@ async def start_polling():
 async def main():
     global session, _connector
     timeout = aiohttp.ClientTimeout(total=30)
-    _connector = aiohttp.TCPConnector(limit=1000, ttl_dns_cache=300, ssl=False)  # ssl=False for simplicity
+    _connector = aiohttp.TCPConnector(limit=1000, ttl_dns_cache=300, ssl=False)
     session = aiohttp.ClientSession(timeout=timeout, connector=_connector, connector_owner=False)
     try:
         asyncio.create_task(web_server())
