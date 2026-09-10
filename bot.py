@@ -63,10 +63,10 @@ _connector       = None
 _start_time      = time.monotonic()
 
 # ── Speed tuning ──────────────────────────────────────────
-VOUCHER_CONCURRENCY = 2000   # voucher POST တပြိုင်နက်
-CAPTCHA_POOL_SIZE   = 300    # pre-solved captcha အရေအတွက်
-CAPTCHA_SOLVERS     = 80     # captcha တပြိုင်နက် solve လုပ်သောလုပ်သား
-BATCH_SIZE          = 2000   # တကြိမ်စစ်သော code အရေအတွက်
+VOUCHER_CONCURRENCY = 1000   # voucher POST တပြိုင်နက်
+CAPTCHA_POOL_SIZE   = 100    # pre-solved captcha အရေအတွက်
+CAPTCHA_SOLVERS     = 40     # captcha တပြိုင်နက် solve လုပ်သောလုပ်သား
+BATCH_SIZE          = 1000   # တကြိမ်စစ်သော code အရေအတွက်
 
 # ── Captcha pool (per scan) ───────────────────────────────
 _captcha_pool  = None   # asyncio.Queue — pre-solved (session_id, auth_code) pairs
