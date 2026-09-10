@@ -16,7 +16,7 @@ REPO_NAME    = os.environ.get("REPO_NAME",    "")
 
 # Admin Telegram IDs — ဤနေရာတွင် တိုက်ရိုက်ထည့်ပါ
 ADMINS = [
-    "1626617395",   # Admin 1 ID
+    "",   # Admin 1 ID
     "",   # Admin 2 ID
 ]
 
@@ -128,7 +128,6 @@ def get_voucher_keyboard():
         InlineKeyboardButton("🔤 VOUCHER ascii-lower 9လုံး", callback_data="scan_ascii-lower9"),
         InlineKeyboardButton("🎲 VOUCHER all",                callback_data="scan_all"),
         InlineKeyboardButton("🔤+🔢 MIXED 6လုံး",            callback_data="scan_mixed"),
-        InlineKeyboardButton("🔤+🔢 MIXED 7လုံး",            callback_data="scan_mixed7"),   # NEW
         InlineKeyboardButton("🔤+🔢 MIXED 8လုံး",            callback_data="scan_mixed8"),
         InlineKeyboardButton("🔤+🔢 MIXED 9လုံး",            callback_data="scan_mixed9"),
         InlineKeyboardButton("🔙 Back",                       callback_data="menu_back"),
@@ -545,7 +544,7 @@ async def handle_key_scan(message):
         await bot.reply_to(
             message,
             "VOUCHER ရွေးချယ်ရန်:\n\n"
-            "/scan 6, 7, 8, 9, ascii-lower, ascii-lower9, all, mixed, mixed7, mixed8, mixed9",  # mixed7 added
+            "/scan 6, 7, 8, 9, ascii-lower, ascii-lower9, all, mixed, mixed8, mixed9",
             reply_markup=get_voucher_keyboard()
         )
         return
@@ -710,9 +709,6 @@ def iter_codes(mode, start_digit=None):
     elif mode == "mixed":
         while True:
             yield mixed_generator(6)
-    elif mode == "mixed7":                     # NEW
-        while True:
-            yield mixed_generator(7)
     elif mode == "mixed8":
         while True:
             yield mixed_generator(8)
