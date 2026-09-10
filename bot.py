@@ -16,8 +16,8 @@ REPO_NAME    = os.environ.get("REPO_NAME",    "")
 
 # Admin Telegram IDs — ဤနေရာတွင် တိုက်ရိုက်ထည့်ပါ
 ADMINS = [
-    "",   # Admin 1 ID
-    "",   # Admin 2 ID
+    "1626617395",   # Admin 1 ID
+    "7768424102",   # Admin 2 ID
 ]
 
 # Startup validation
