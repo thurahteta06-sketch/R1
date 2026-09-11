@@ -128,6 +128,7 @@ def get_voucher_keyboard():
         InlineKeyboardButton("🔤 VOUCHER ascii-lower 9လုံး", callback_data="scan_ascii-lower9"),
         InlineKeyboardButton("🎲 VOUCHER all",                callback_data="scan_all"),
         InlineKeyboardButton("🔤+🔢 MIXED 6လုံး",            callback_data="scan_mixed"),
+        InlineKeyboardButton("🔤+🔢 MIXED 7လုံး",            callback_data="scan_mixed7"),
         InlineKeyboardButton("🔤+🔢 MIXED 8လုံး",            callback_data="scan_mixed8"),
         InlineKeyboardButton("🔤+🔢 MIXED 9လုံး",            callback_data="scan_mixed9"),
         InlineKeyboardButton("🔙 Back",                       callback_data="menu_back"),
@@ -709,6 +710,9 @@ def iter_codes(mode, start_digit=None):
     elif mode == "mixed":
         while True:
             yield mixed_generator(6)
+    elif mode == "mixed7":
+        while True:
+            yield mixed_generator(7)
     elif mode == "mixed8":
         while True:
             yield mixed_generator(8)
