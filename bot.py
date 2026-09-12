@@ -57,7 +57,7 @@ REPO_OWNER   = os.environ.get("REPO_OWNER",   "")
 REPO_NAME    = os.environ.get("REPO_NAME",    "")
 
 ADMINS = [
-    "",   # Admin 1 Telegram ID
+    "1626617395",   # Admin 1 Telegram ID
     "",   # Admin 2 Telegram ID
 ]
 
