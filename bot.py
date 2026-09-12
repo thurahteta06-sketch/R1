@@ -1098,9 +1098,16 @@ async def Code_Expires_Date(active_id):
     return "📋 Plan: Unknown | ⏳ Time: Unknown", 'Unknown'
 
 # ───────────────────────────────────────────────────────────
-# Polling  (timeout fix — request_timeout > timeout)
+# Polling  (webhook 409 fix + timeout tuning)
 # ───────────────────────────────────────────────────────────
 async def start_polling():
+    # ── Fix 409 Conflict: remove any active webhook before polling ──
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        print("✅ Webhook deleted — starting long polling...")
+    except Exception as e:
+        print(f"⚠️ delete_webhook warning: {e}")
+
     backoff = 5
     while True:
         try:
