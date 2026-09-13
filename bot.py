@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════════════════════════════════
-#  VOUCHER BOT — Ruijie 2026 System Update Support
+#  VOUCHER BOT — Ruijie 2026 + WiFiDog URL Support
 #  Admin: 1626617395
-#  Fixed: Polling TimeoutError + Captcha-aware retry
+#  Features: Captcha retry, session refresh, WiFiDog URL, polling fix
 # ═══════════════════════════════════════════════════════════════════════════
 import asyncio, aiohttp, json, base64, random, re, os, string, time, uuid
 import logging
@@ -393,33 +393,67 @@ async def Varify_Captcha(sess, session_id, text):
         data = await req.json(content_type=None)
         return session_id if data.get("success") == True else None
 
+# ─── Session URL check (WiFiDog aware) ──────────────────────────────────
 async def check_session_url(session_url):
     if not is_safe_url(session_url):
         return False
+
     headers = {
-        "accept": "text/html,*/*;q=0.8",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+        "user-agent": "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36",
     }
-    try:
-        if "sessionId" in session_url:
+
+    # ── WiFiDog URL: Ruijie portal entry point (no sessionId yet) ──
+    if "/api/auth/wifidog" in session_url or "stage=portal" in session_url:
+        required = ["gw_id", "gw_sn", "gw_address", "gw_port", "mac"]
+        if all(p in session_url for p in required):
+            logger.info("✅ WiFiDog URL accepted — portal will issue sessionId")
             return True
-        async with session.get(session_url, allow_redirects=True, headers=headers,
-                               timeout=aiohttp.ClientTimeout(total=20)) as resp:
+        else:
+            logger.warning("⚠️ WiFiDog URL missing required params")
+            return False
+
+    # ── Direct sessionId in URL ───────────────────────────────
+    if "sessionId" in session_url:
+        return True
+
+    # ── Follow redirects and search everywhere ────────────────
+    try:
+        async with session.get(
+            session_url,
+            allow_redirects=True,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as resp:
             if "sessionId" in str(resp.url):
+                logger.info("✅ sessionId found in final URL")
                 return True
+
             for h in resp.history:
                 if "sessionId" in str(h.url):
+                    logger.info("✅ sessionId found in redirect")
                     return True
                 loc = h.headers.get("Location", "")
                 if "sessionId" in loc:
+                    logger.info("✅ sessionId found in Location header")
                     return True
+
             try:
                 body = await resp.text()
                 if "sessionId" in body:
+                    m = re.search(r'sessionId[=:"\']+([a-zA-Z0-9]+)', body)
+                    if m:
+                        logger.info(f"✅ sessionId in body: {m.group(1)[:20]}...")
                     return True
             except Exception:
                 pass
+
             return False
+
+    except asyncio.TimeoutError:
+        logger.warning("check_session_url: timeout")
+        return False
     except Exception as e:
         logger.error(f"check_session_url: {e}")
         return False
@@ -826,6 +860,7 @@ async def cmd_help(message):
         message.chat.id,
         "📖 Voucher Bot အသုံးပြုနည်း\n\n"
         "၁။ /setup <url>              – Session URL ထည့်ရန်\n"
+        "      (WiFiDog URL လည်း ရပါတယ်)\n"
         "၂။ /brute <mode> <len> [n]   – ရှာဖွေရန်\n"
         "      Mode: 1=0-9, 2=a-z, 3=A-Z, 4=a-zA-Z, 5=a-z0-9\n"
         "      ဥပမာ: /brute 1 6 5\n"
@@ -1072,9 +1107,8 @@ async def cb_handler(call):
         except Exception:
             pass
 
-# ─── Polling (FIXED — TimeoutError spam resolved) ──────────────────────
+# ─── Polling ───────────────────────────────────────────────────────────
 async def start_polling():
-    # Suppress telebot's noisy timeout logs (they're non-fatal)
     logging.getLogger("TeleBot").setLevel(logging.CRITICAL)
 
     try:
@@ -1092,7 +1126,6 @@ async def start_polling():
     backoff = 5
     while True:
         try:
-            # timeout=30 (Telegram hold), request_timeout=90 (aiohttp) → 60s buffer
             await bot.infinity_polling(
                 timeout=30,
                 request_timeout=90,
@@ -1101,7 +1134,6 @@ async def start_polling():
             )
             return
         except asyncio.TimeoutError:
-            # Normal long-poll rotation — NOT an error
             continue
         except aiohttp.ClientError as e:
             logger.warning(f"Polling connection error: {e}. Retry in {backoff}s")
