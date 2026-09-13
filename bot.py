@@ -9,10 +9,10 @@ from datetime import datetime, timedelta, timezone
 
 # ── Environment variables ─────────────────────────────────────────────────
 BOT_TOKEN = "8736933070:AAGnasd-JsE2Zj17bTNhiFTTj0WfjUEd1nY"
-GITHUB_TOKEN =
-ADMIN_ID =
-REPO_OWNER =
-REPO_NAME =
+GITHUB_TOKEN = "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"
+ADMIN_ID = "1626617395"
+REPO_OWNER = "thurahteta06-sketch"
+REPO_NAME = "R1"
 
 # ── Global structures ─────────────────────────────────────────────────────
 SUCCESS_CODE = asyncio.Queue()
