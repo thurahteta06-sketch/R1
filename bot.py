@@ -997,6 +997,27 @@ async def cmd_recheck(message):
     if not is_admin(message.chat.id): return
     await _do_recheck(message.chat.id)
 
+# ─── Fallback text handler ──────────────────────────────────────────────
+@bot.message_handler(content_types=["text"])
+async def cmd_text(message):
+    chat_id = message.chat.id
+    user_data.setdefault(chat_id, {})
+    notify_setting.setdefault(chat_id, True)
+    text = (message.text or "").strip()
+
+    if not is_admin(chat_id):
+        await bot.reply_to(
+            message,
+            "👋 မင်္ဂလာပါ။ ဤ Bot ကို အသုံးပြုရန် Admin ခွင့်ပြုချက် လိုအပ်ပါသည်။\n"
+            "/start ကို နှိပ်ပြီး Menu ကြည့်ရှုနိုင်ပါသည်။")
+        return
+
+    await bot.reply_to(
+        message,
+        f"📩 Message လက်ခံရရှိပါပြီ: \"{text}\"\n\n"
+        "🔎 Command အသုံးပြုရန် /help ကို ကြည့်ပါ, သို့မဟုတ် Menu ကို /start ဖြင့် ဖွင့်ပါ။",
+        reply_markup=kb_main())
+
 # ─── Callbacks ─────────────────────────────────────────────────────────
 @bot.callback_query_handler(func=lambda call: True)
 async def cb_handler(call):
