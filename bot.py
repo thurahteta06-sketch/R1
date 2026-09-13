@@ -15,7 +15,7 @@ REPO_NAME    = os.environ.get("REPO_NAME",    "")
 WEBHOOK_URL  = os.environ.get("WEBHOOK_URL", "").rstrip("/")
 
 ADMINS = [
-    "",   # Admin 1 ID
+    "1626617395",   # Admin 1 ID
     "",   # Admin 2 ID
 ]
 
