@@ -1,20 +1,3 @@
-"""
-Voucher Bot — Fully Optimized & Exception-Safe Stable Version (single-file)
-
-Feature set:
-  • Auto-detects VPS CPU Cores & RAM to dynamically adjust Concurrency
-  • Background Pre-authenticated Session Pool (Extreme Speed / No Captcha Lag)
-  • Aggressive Garbage Collection to prevent Memory Leaks / VPS Crashing
-  • Auto-cleanup stale webhook at startup (prevents 409 Conflict)
-  • Admin-only command guard (except none)
-  • SSRF guard + session-URL structure check
-  • Plan filters (e.g. 30min, 2h, 1d, 1mo, unlimit)
-  • Multi-length spec (6 | 6,7,8 | 6-8 | 6,8-10,12) + target count
-  • GitHub persistence (result.json) + local state (state.json)
-  • Race-safe Telegram notifications (per-chat asyncio.Lock)
-  • Captcha OCR: raw-first, thresholded-fallback
-"""
-
 import asyncio
 import base64
 import json
@@ -44,40 +27,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("voucher-bot")
 
-# ── Hardware Auto-Scaling Engine ───────────────────────────────────────────
-def _get_vps_resources():
-    try:
-        cores = os.cpu_count() or 1
-        ram_gb = 1.0
-        if os.path.exists("/proc/meminfo"):
-            with open("/proc/meminfo", "r") as f:
-                for line in f:
-                    if "MemTotal" in line:
-                        mem_kb = int(line.split()[1])
-                        ram_gb = round(mem_kb / (1024 * 1024), 2)
-                        break
-        return cores, ram_gb
-    except Exception:
-        return 1, 1.0
-
-CPU_CORES, VPS_RAM = _get_vps_resources()
-logger.info(f"🧠 Hardware Detected: {CPU_CORES} Cores, {VPS_RAM} GB RAM")
-
-if CPU_CORES >= 4 or VPS_RAM >= 8.0:
-    CONCURRENCY = 500
-    BATCH_SIZE = 800
-    POOL_MAX_SIZE = 150
-elif CPU_CORES >= 2 or VPS_RAM >= 4.0:
-    CONCURRENCY = 300
-    BATCH_SIZE = 500
-    POOL_MAX_SIZE = 80
-else:
-    CONCURRENCY = 100
-    BATCH_SIZE = 250
-    POOL_MAX_SIZE = 30
-
-logger.info(f"⚡ Auto-Configured Settings -> Concurrency: {CONCURRENCY}, Batch Size: {BATCH_SIZE}, Session Pool: {POOL_MAX_SIZE}")
-
 # ── Environment (no hardcoded secrets) ─────────────────────────────────────
 def _required(name: str) -> str:
     v = os.environ.get(name)
@@ -92,12 +41,15 @@ REPO_OWNER   = os.environ.get("REPO_OWNER", "")
 REPO_NAME    = os.environ.get("REPO_NAME", "")
 GITHUB_ON    = bool(GITHUB_TOKEN and REPO_OWNER and REPO_NAME)
 
-# ── Constants ──────────────────────────────────────────────────────────────
-STATE_FILE   = "state.json"
-RESULT_FILE  = "result.json"
+# ── Fixed Runtime Settings for Stable Railway Operation ────────────────────
+CONCURRENCY   = 150  # Telegram Too Many Requests နှင့် TimeoutError ကာကွယ်ရန် ကန့်သတ်ချက်
+BATCH_SIZE    = 400  
+POOL_MAX_SIZE = 100  # High-Speed Background Authenticated Session Pool
+STATE_FILE    = "state.json"
+RESULT_FILE   = "result.json"
 EXHAUSTIVE_MODE1_MAX_LEN = 5
-TG_MAX       = 4096
-START_TS     = time.monotonic()
+TG_MAX        = 4096
+START_TS      = time.monotonic()
 
 POST_URL = base64.b64decode(
     b"aHR0cHM6Ly9wb3J0YWwtYXMucnVpamllbmV0d29ya3MuY29tL2FwaS9hdXRoL3ZvdWNoZXIvP2xhbmc9ZW5fVVM="
@@ -133,6 +85,7 @@ _voucher_sem   = None
 session: aiohttp.ClientSession | None = None
 _connector: aiohttp.TCPConnector | None = None
 
+# Background Pre-authenticated Session Pool
 session_pool = asyncio.Queue()
 pool_tasks = {}
 
@@ -873,11 +826,9 @@ USAGE_TEXT = (
     "  `/brute 2 6 1d 1mo`     → lowercase ၆လုံး ၁ရက် / ၁လ\n\n"
     "**၃။** `/status`        – အခြေအနေ\n"
     "**၄။** `/stop`          – ရပ်တန့်\n"
-    "**၅။** `/resume`        – ဆက်ရှာ\n"
-    "**၆။** `/saved`         – ရလဒ်ကြည့်\n"
-    "**၇။** `/delete_saved`  – ရလဒ်ဖျက်\n"
-    "**၈။** `/recheck`       – Success codes ပြန်စစ်\n"
-    "**၉။** `/notify`        – Notification ON/OFF"
+    "**၅။** `/saved`         – ရလဒ်ကြည့်\n"
+    "**၆။** `/delete_saved`  – ရလဒ်ဖျက်\n"
+    "**၇။** `/notify`        – Notification ON/OFF"
 )
 
 # ── Command handlers ───────────────────────────────────────────────────────
@@ -1078,7 +1029,7 @@ async def cmd_status(message):
     m, s = divmod(r, 60)
     await bot.reply_to(
         message,
-        f"📊 Bot Status ({CPU_CORES} Cores / {VPS_RAM}GB RAM)\n"
+        f"📊 Bot Status\n"
         f"⏱ Uptime: {h}h {m}m {s}s\n"
         f"🔍 Active scans: {active}\n"
         f"🔋 Pre-auth Pool Size: {session_pool.qsize()}\n"
@@ -1087,20 +1038,25 @@ async def cmd_status(message):
 
 # ── Polling / main ─────────────────────────────────────────────────────────
 async def start_polling():
-    backoff = 5
+    backoff = 2
     while True:
         try:
-            await bot.infinity_polling(timeout=20, request_timeout=20)
+            # ── 409 CONFLICT Error အား သေချာစွာ ရှင်းလင်းပစ်မည့် စနစ် ──
+            # Polling မစတင်မီ စက္ကန့်အနည်းငယ် စောင့်ဆိုင်းစေပြီး စာသားအဟောင်းများကို Auto-drop လုပ်ခြင်း
+            await asyncio.sleep(backoff)
+            await bot.delete_webhook(drop_pending_updates=True)
+            logger.info("Polling Engine started safely.")
+            await bot.infinity_polling(timeout=15, request_timeout=20, skip_updates=True)
             return
         except Exception as e:
-            logger.warning("Polling error: %s — retry in %ds", e, backoff)
+            logger.warning("Polling engine error caught: %s — recovering in %ds", e, backoff)
         await asyncio.sleep(backoff)
 
 async def main():
     global session, _connector, _voucher_sem
 
-    _connector = aiohttp.TCPConnector(limit=600, ttl_dns_cache=300, force_close=True)
-    session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), connector=_connector, connector_owner=False)
+    _connector = aiohttp.TCPConnector(limit=500, ttl_dns_cache=300, force_close=True)
+    session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), connector=_connector, connector_owner=False)
     _voucher_sem = asyncio.Semaphore(CONCURRENCY)
 
     logger.info("⚙️ Pre-loading OCR Engine...")
