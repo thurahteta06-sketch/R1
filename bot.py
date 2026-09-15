@@ -58,8 +58,8 @@ REPO_NAME    = os.environ.get("REPO_NAME", "")
 GITHUB_ON    = bool(GITHUB_TOKEN and REPO_OWNER and REPO_NAME)
 
 # ── Constants ──────────────────────────────────────────────────────────────
-CONCURRENCY  = 1000
-BATCH_SIZE   = 1000
+CONCURRENCY  = 200
+BATCH_SIZE   = 500
 STATE_FILE   = "state.json"
 RESULT_FILE  = "result.json"
 EXHAUSTIVE_MODE1_MAX_LEN = 5
