@@ -36,7 +36,7 @@ notify_state = {}
 session = None
 _connector = None
 
-CONCURRENCY = 1000
+CONCURRENCY = 200
 _voucher_sem = None
 _start_time = time.monotonic()
 
