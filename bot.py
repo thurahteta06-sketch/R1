@@ -261,8 +261,6 @@ def iter_codes(mode, length):
             yield str(i).zfill(length)
         return
 
-    # NOTE: for length 7+, collisions are possible. Set-dedup would cost
-    # huge RAM. For true exhaustiveness, prefer length ≤ 6 in mode 1.
     while True:
         yield "".join(random.choice(chars) for _ in range(length))
 
@@ -518,7 +516,6 @@ async def perform_check(session_url, code, chat_id,
         if recheck:
             return code
 
-        # Extract token from logonUrl if present, otherwise use session_id
         token = session_id
         try:
             res_data  = json.loads(response)
@@ -538,7 +535,6 @@ async def perform_check(session_url, code, chat_id,
         except Exception:
             pass
 
-        # Plan filter — ONLY apply if plan is known
         if plan_filters and plan_str not in ("N/A", "Error"):
             code_mins = plan_to_minutes(plan_str)
             if not any(code_mins >= plan_to_minutes(f) for f in plan_filters):
@@ -899,7 +895,6 @@ async def cmd_setup(message):
             "❌ Session URL မှားနေသည် (သို့) required params မပါပါ။")
         return
 
-    # If a previous session existed → ask to confirm (protects saved codes)
     if chat_id in user_data and user_data[chat_id].get("session_url") != url:
         setup_confirm[chat_id] = url
         markup = InlineKeyboardMarkup()
@@ -919,7 +914,6 @@ async def cmd_setup(message):
 
 
 async def _apply_setup(chat_id, url):
-    # Cancel any active scan
     if chat_id in scan_tasks:
         info = scan_tasks.pop(chat_id, None)
         if info and info.get("task"):
@@ -933,7 +927,6 @@ async def _apply_setup(chat_id, url):
     notify_state.pop(chat_id, None)
     limited_notify.pop(chat_id, None)
 
-    # Clear saved results for this chat
     if GITHUB_ENABLED:
         try:
             results, sha = await get_file_content("result.json")
@@ -1274,6 +1267,13 @@ async def start_polling():
     backoff = 5
     while True:
         try:
+            # Startup cleanup
+            try:
+                await bot.delete_webhook(drop_pending_updates=True)
+                logger.info("Cleared webhook & pending updates")
+            except Exception as e:
+                logger.warning(f"delete_webhook failed: {e}")
+
             await bot.infinity_polling(timeout=20, request_timeout=20)
             return
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -1281,9 +1281,18 @@ async def start_polling():
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
         except Exception as e:
-            logger.exception(f"Unexpected polling error: {e}")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
+            msg = str(e)
+            if "409" in msg or "Conflict" in msg:
+                logger.error(
+                    "❌ 409 Conflict — duplicate instance. "
+                    "Railway → Settings → Deploy → Overlap time = 0. "
+                    "Waiting 30s..."
+                )
+                await asyncio.sleep(30)
+            else:
+                logger.exception(f"Unexpected polling error: {e}")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
 
 
 async def main():
@@ -1295,7 +1304,7 @@ async def main():
     )
     _voucher_sem = asyncio.Semaphore(CONCURRENCY)
 
-    logger.info("🚀 Voucher Bot starting...")
+    logger.info(f"🚀 Voucher Bot starting... (CONCURRENCY={CONCURRENCY})")
     try:
         asyncio.create_task(web_server())
         if GITHUB_ENABLED:
