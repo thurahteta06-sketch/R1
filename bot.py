@@ -4,7 +4,12 @@ from telebot.async_telebot import AsyncTeleBot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from telebot import asyncio_helper
 from aiohttp import web
-from aiohttp_socks import ProxyConnector
+try:
+    from aiohttp_socks import ProxyConnector
+    _SOCKS_AVAILABLE = True
+except ImportError:
+    ProxyConnector = None
+    _SOCKS_AVAILABLE = False
 import cv2, ddddocr, numpy as np
 from datetime import datetime, timedelta, timezone
 
@@ -136,14 +141,17 @@ class RateLimiter:
 
 # ── Connector Factory (Proxy-Aware) ──────────────────────────────────────
 def create_connector():
-    """PROXY_URL ရှိရင် ProxyConnector, မရှိရင် TCPConnector။ SSL 2026 မှာ enabled."""
+    """PROXY_URL ရှိပြီး aiohttp-socks ထည့်ထားရင် ProxyConnector, မဟုတ်ရင် TCPConnector"""
     if PROXY_URL:
-        try:
-            conn = ProxyConnector.from_url(PROXY_URL, limit=1000, rdns=True)
-            log.info(f"🔒 Proxy connector created: {PROXY_URL}")
-            return conn
-        except Exception as e:
-            log.error(f"❌ Proxy setup failed ({e}) — direct connection.")
+        if not _SOCKS_AVAILABLE:
+            log.warning("⚠️ PROXY_URL set but aiohttp-socks not installed — using direct connection.")
+        else:
+            try:
+                conn = ProxyConnector.from_url(PROXY_URL, limit=1000, rdns=True)
+                log.info(f"🔒 Proxy connector: {PROXY_URL}")
+                return conn
+            except Exception as e:
+                log.error(f"❌ Proxy failed ({e}) — direct connection.")
     return aiohttp.TCPConnector(limit=1000, ttl_dns_cache=300)
 
 # ── Key Auth Helpers ──────────────────────────────────────────────────────
