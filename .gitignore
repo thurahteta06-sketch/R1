@@ -1,5 +1,33 @@
+# Python
 __pycache__/
-*.pyc
-.env
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+
+# Virtual environment
 venv/
+.venv/
+env/
+
+# Environment variables (⚠️ ဒါက အရေးကြီးဆုံး)
+.env
+*.env
+config.local.*
+
+# Logs
 *.log
+ruijie_bot.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Build
+build/
+dist/
