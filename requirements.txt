@@ -1,3 +1,14 @@
-pyTelegramBotAPI>=4.15.0
-aiohttp>=3.9.0
-playwright>=1.40.0
+# venv ဖန်တီးခြင်း (တစ်ခါပဲလုပ်ရမယ်)
+python -m venv venv
+
+# venv activate လုပ်ခြင်း
+# Windows:
+venv\Scripts\activate
+# Mac/Linux:
+source venv/bin/activate
+
+# လိုအပ်တဲ့ package တွေ install
+pip install pyTelegramBotAPI aiohttp opencv-python ddddocr numpy
+
+# requirements.txt ထုတ်ခြင်း
+pip freeze > requirements.txt
